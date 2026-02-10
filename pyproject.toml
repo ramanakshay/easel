@@ -1,0 +1,33 @@
+[project]
+name = "easel"
+version = "0.1.0"
+description = "A generalizable deep learning library for SL and RL tasks."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Akshay Raman" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0.0",
+    "accelerate>=0.20.0",
+    "numpy",
+    "tqdm",
+    "safetensors",
+]
+
+[build-system]
+# uv has its own build backend 'uv_build' optimized for performance
+requires = ["uv_build>=0.5.0"]
+build-backend = "uv_build"
+
+# uv_build automatically detects the 'src' layout, so explicit configuration
+# is often unnecessary, but this ensures it looks in the right place.
+[tool.uv]
+package = true
