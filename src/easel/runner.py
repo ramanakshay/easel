@@ -49,6 +49,9 @@ class Runner:
                  eval_batch_size: int = 32,
                  dataloader_config: Optional[Dict[str, Any]] = None,
 
+                 # --- Model Configs ---
+                 optimizer_config: Optional[Dict[str, Any]] = None,
+
                  # --- Accelerator ---
                  mixed_precision: str = "no",
                  grad_accum_steps: int = 1,
@@ -144,6 +147,7 @@ class Runner:
 
         self.sync_batch_norm = sync_batch_norm
 
+        self.optimizer_config = optimizer_config or {}
         self.optimizers = []
         self.schedulers = []
 
@@ -173,7 +177,7 @@ class Runner:
         # We initialize optimizers BEFORE compilation.
         # This ensures we can access 'configure_optimizers' on the clean Module object.
         if self.do_train:
-            self.setup_optimizers()
+            self.setup_optimizers(**self.optimizer_config)
 
         # 3. Compilation
         # We compile last. torch.compile wraps the model execution logic.

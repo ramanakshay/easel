@@ -392,9 +392,6 @@ class Trainer(Runner):
                     "throughput": throughput
                 }
 
-                # Log to buffer
-                self.log(metrics)
-
                 # Pass metrics to user hook
                 self.on_train_step_end(metrics, epoch_step)
 
