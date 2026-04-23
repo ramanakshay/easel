@@ -8,8 +8,8 @@ import torch
 from accelerate import Accelerator
 from accelerate.utils import set_seed, TorchDynamoPlugin
 
-from easel.data import Data
-from easel.model import Model
+from ..data import Data
+from ..model import Model
 
 logger = logging.getLogger(__name__)
 
@@ -100,8 +100,8 @@ class BaseTrainer:
         self.log_config = log_config or {}
 
         # --- Boot Sequence ---
-        self.setup_globals()
         self.setup_accelerator()
+        self.setup_globals()
         self.setup_data()
         self.setup_model()
 

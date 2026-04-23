@@ -4,7 +4,9 @@ from torch.utils.data import TensorDataset
 import logging
 
 # Import your library components (adjust the import paths as needed)
-from easel import Data, Model, Trainer
+from easel import Data, Model
+
+from easel.trainer.base import BaseTrainer
 
 # Set up logging to see the output
 logging.basicConfig(level=logging.INFO)
