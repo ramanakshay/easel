@@ -1,68 +1,121 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
-from torch.optim import Adam
+from torch.utils.data import TensorDataset
+import logging
 
-# Import from your library
-from easel import Module, DataModule, Trainer
+# Import your library components (adjust the import paths as needed)
+from easel import Data, Model, Trainer
 
-# 1. Define a dummy dataset
-class SimpleData(DataModule):
+# Set up logging to see the output
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ==========================================
+# 1. Dummy Implementations
+# ==========================================
+
+class DummyData(Data):
+    def setup(self, stage=None):
+        # Create a simple dataset: 100 samples, 10 features, 1 target
+        x = torch.randn(100, 10)
+        y = torch.randn(100, 1)
+        dataset = TensorDataset(x, y)
+
+        self.train_dataset = dataset
+        self.val_dataset = dataset
+
+class DummyModel(Model):
     def __init__(self):
         super().__init__()
-        # Create 100 random samples (Input: 10 dim, Output: 1 dim)
-        self.x = torch.randn(100, 10)
-        self.y = torch.randn(100, 1)
-        self.dataset = TensorDataset(self.x, self.y)
+        self.layer = nn.Linear(10, 1)
 
-    def train_dataloader(self):
-        return DataLoader(self.dataset, batch_size=10, shuffle=True)
+    def forward(self, x):
+        return self.layer(x)
 
-    def val_dataloader(self):
-        return DataLoader(self.dataset, batch_size=10)
+    def configure_optimizers(self):
+        # Test standardizing a single optimizer and scheduler dict
+        optimizer = torch.optim.Adam(self.parameters(), lr=0.01)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+        return {
+            "optimizer": optimizer,
+            "scheduler": {
+                "scheduler": scheduler,
+                "interval": 1,
+                "strategy": "epoch"
+            }
+        }
 
-# 2. Define the training logic by subclassing Trainer
-class SimpleTrainer(Trainer):
-    def train_step(self, batch, batch_idx):
-        x, y = batch
-        # self.model is the wrapped Module; we call it directly
-        preds = self.model(x)
-        loss = nn.MSELoss()(preds, y)
-        return loss
+# ==========================================
+# 2. The Test Script
+# ==========================================
 
-    def val_step(self, batch, batch_idx):
-        x, y = batch
-        preds = self.model(x)
-        loss = nn.MSELoss()(preds, y)
-        # Log validation loss to the progress bar/logger
-        self.log({"val_loss": loss})
-        return loss
+def run_tests():
+    logger.info("--- Starting Architecture Tests ---")
 
-# 3. Setup the components
-def main():
-    # A simple PyTorch model
-    pytorch_model = nn.Linear(10, 1)
-    optimizer = Adam(pytorch_model.parameters(), lr=0.01)
+    # 1. Instantiate user objects
+    data = DummyData()
+    model = DummyModel()
 
-    # Wrap in Easel Module
-    model = Module(model=pytorch_model, optimizers=optimizer)
-
-    # Initialize Data
-    data = SimpleData()
-
-    # Initialize Trainer
-    trainer = SimpleTrainer(
+    # 2. Instantiate BaseTrainer
+    # This automatically triggers the Boot Sequence (setup_globals, setup_accelerator, etc.)
+    logger.info("Initializing BaseTrainer...")
+    trainer = BaseTrainer(
         model=model,
         data=data,
-        max_epochs=3,
-        experiment_name="test_run",
-        accelerator_config={"cpu": True} # Force CPU for simple testing
+        do_train=True,
+        do_val=True,
+        train_batch_size=16,
+        seed=42,
+        mixed_precision="no" # Set to "fp16" if you have a GPU
     )
 
-    # 4. Run!
-    print("Starting training...")
-    trainer.run()
-    print("Training complete!")
+    # 3. Assertions & State Checks
+    logger.info("Running assertions...")
+
+    # Check Data
+    assert trainer.train_dataloader is not None, "Train dataloader was not created!"
+    assert trainer.val_dataloader is not None, "Val dataloader was not created!"
+    logger.info("✅ Dataloaders successfully prepared and wrapped.")
+
+    # Check Optimizers
+    assert len(trainer.optimizers) == 1, "Optimizer was not parsed correctly!"
+    assert len(trainer.schedulers) == 1, "Scheduler was not parsed correctly!"
+    logger.info("✅ Optimizers and Schedulers successfully parsed and standardized.")
+
+    # Check Model Device Placement (Accelerate should have moved it)
+    batch = next(iter(trainer.train_dataloader))
+    x, y = batch
+    assert next(trainer.model.parameters()).device == x.device, "Model and data are on different devices!"
+    logger.info(f"✅ Model and Data successfully moved to: {trainer.device}")
+
+    # 4. Simulate a Single Training Step
+    logger.info("Simulating a single training step using BaseTrainer primitives...")
+
+    # Zero gradients
+    trainer.optimizers_zero_grad()
+
+    # Forward pass (simulating the autocast context manager)
+    with trainer.autocast():
+        predictions = trainer.model(x)
+        loss = nn.functional.mse_loss(predictions, y)
+
+    # Backward pass
+    trainer.backward(loss)
+
+    # Optimizer step
+    trainer.optimizers_step()
+
+    # Scheduler step (simulating end of epoch)
+    trainer.schedulers_step(strategy="epoch", counter=1)
+
+    logger.info("✅ Forward, Backward, and Optimization steps executed without crashing.")
+
+    # 5. Test State Saving (Optional but recommended)
+    logger.info("Testing state saving...")
+    trainer.save_state("./test_checkpoint")
+    logger.info("✅ State successfully saved.")
+
+    logger.info("--- All Tests Passed! Architecture is sound. ---")
 
 if __name__ == "__main__":
-    main()
+    run_tests()

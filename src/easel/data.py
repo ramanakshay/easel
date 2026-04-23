@@ -1,23 +1,18 @@
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset
-from typing import Optional, Any, Union
+from typing import Optional, Union
 
-class DataModule:
-    """
-    Standard interface for data loading.
-    """
+class Data:
+    def __init__(self):
+        self.train_dataset: Optional[Union[Dataset, IterableDataset]] = None
+        self.val_dataset: Optional[Union[Dataset, IterableDataset]] = None
+        self.test_dataset: Optional[Union[Dataset, IterableDataset]] = None
+        self.predict_dataset: Optional[Union[Dataset, IterableDataset]] = None
 
-    def __init__(self, train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
-                     val_dataset: Optional[Union[Dataset, IterableDataset]] = None,
-                     test_dataset: Optional[Union[Dataset, IterableDataset]] = None):
-        self.train_dataset = train_dataset
-        self.val_dataset = val_dataset
-        self.test_dataset = test_dataset
-
-    def prepare_data(self):
+    def prepare(self):
         pass
 
-    def setup(self):
+    def setup(self, stage: Optional[str] = None):
         pass
 
     def train_dataloader(self, **kwargs) -> Union[DataLoader, None]:
@@ -34,3 +29,8 @@ class DataModule:
         if self.test_dataset is None:
             return None
         return DataLoader(self.test_dataset, **kwargs)
+
+    def predict_dataloader(self, **kwargs) -> Union[DataLoader, None]:
+        if self.predict_dataset is None:
+            return None
+        return DataLoader(self.predict_dataset, **kwargs)
