@@ -1,6 +1,8 @@
 from typing import Any, Dict, List, Optional, Union
 import math
 
+from ..data import Data
+from ..model import Model
 from .base import BaseTrainer
 
 class Trainer(BaseTrainer):
