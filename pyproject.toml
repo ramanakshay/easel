@@ -1,7 +1,7 @@
 [project]
 name = "easel"
 version = "0.0.1"
-description = "A generalizable deep learning library for SL and RL tasks."
+description = "A generalizable deep learning library for SL tasks."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { file = "LICENSE" }
