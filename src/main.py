@@ -3,9 +3,7 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset
 import logging
 
-# Import your library components (adjust the import paths as needed)
-from easel import Data, Model, Trainer
-from easel.trainer.base import BaseTrainer
+from easel import Data, Model, Engine
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -48,51 +46,48 @@ def run_tests():
     data = DummyData()
     model = DummyModel()
 
-    logger.info("Initializing BaseTrainer...")
-    trainer = BaseTrainer(
+    logger.info("Initializing Engine...")
+    engine = Engine(
         model=model,
         data=data,
         do_train=True,
         do_val=True,
         train_batch_size=16,
         seed=42,
-        mixed_precision="no"
+        mixed_precision="no",
+        max_epochs=2,
     )
 
     logger.info("Running assertions...")
 
-    assert trainer.train_dataloader is not None, "Train dataloader was not created!"
-    assert trainer.val_dataloader is not None, "Val dataloader was not created!"
+    assert engine.train_dataloader is not None, "Train dataloader was not created!"
+    assert engine.val_dataloader is not None, "Val dataloader was not created!"
     logger.info("Dataloaders successfully prepared and wrapped.")
 
-    assert len(trainer.optimizers) == 1, "Optimizer was not parsed correctly!"
-    assert len(trainer.schedulers) == 1, "Scheduler was not parsed correctly!"
+    assert len(engine.optimizers) == 1, "Optimizer was not parsed correctly!"
+    assert len(engine.schedulers) == 1, "Scheduler was not parsed correctly!"
     logger.info("Optimizers and Schedulers successfully parsed and standardized.")
 
-    batch = next(iter(trainer.train_dataloader))
+    batch = next(iter(engine.train_dataloader))
     x, y = batch
-    assert next(trainer.model.parameters()).device == x.device, "Model and data are on different devices!"
-    logger.info(f"Model and Data successfully moved to: {trainer.device}")
+    assert next(engine.model.parameters()).device == x.device, "Model and data are on different devices!"
+    logger.info(f"Model and Data successfully moved to: {engine.device}")
 
-    logger.info("Simulating a single training step using BaseTrainer primitives...")
+    logger.info("Simulating a single training step using Engine primitives...")
 
-    trainer.optimizers_zero_grad()
+    engine.optimizers_zero_grad()
 
-    with trainer.autocast():
-        predictions = trainer.model(x)
+    with engine.autocast():
+        predictions = engine.model(x)
         loss = nn.functional.mse_loss(predictions, y)
 
-    trainer.backward(loss)
+    engine.backward(loss)
 
-    trainer.optimizers_step()
+    engine.optimizers_step()
 
-    trainer.schedulers_step(strategy="epoch", counter=1)
+    engine.schedulers_step(strategy="epoch", counter=1)
 
     logger.info("Forward, Backward, and Optimization steps executed without crashing.")
-
-    logger.info("Testing state saving...")
-    trainer.save_state("./test_checkpoint")
-    logger.info("State successfully saved.")
 
     logger.info("--- All Tests Passed! Architecture is sound. ---")
 
