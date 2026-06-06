@@ -20,11 +20,13 @@ class Engine:
                  data: Data,
                  model: Model,
 
+                 # ── Mode flags ──
                  do_train: bool = False,
                  do_val: bool = False,
                  do_test: bool = False,
                  do_predict: bool = False,
 
+                 # ── Loop limits ──
                  max_epochs: Optional[int] = None,
                  max_steps: Optional[int] = None,
                  train_steps_per_epoch: Optional[int] = None,
@@ -32,34 +34,45 @@ class Engine:
                  test_steps_per_epoch: Optional[int] = None,
                  predict_steps_per_epoch: Optional[int] = None,
 
+                 # ── Validation ──
                  val_strategy: str = "epoch",
                  val_start: int = 0,
                  val_interval: int = 1,
 
+                 # ── Stage ──
                  stage: Optional[str] = None,
+
+                 # ── Batching ──
                  train_batch_size: int = 32,
                  eval_batch_size: int = 32,
-                 dataloader_config: Optional[Dict[str, Any]] = None,
 
-                 mixed_precision: str = "no",
+                 # ── Optimization ──
                  gradient_accumulation_steps: int = 1,
-                 compile: bool = False,
                  gradient_clip_value: float = 0.0,
                  gradient_clip_algorithm: str = "norm",
-                 sync_batch_norm: bool = False,
-                 optimizer_config: Optional[Dict[str, Any]] = None,
-                 accelerator_config: Optional[Dict[str, Any]] = None,
 
+                 # ── Precision & compilation ──
+                 mixed_precision: str = "no",
+                 compile: bool = False,
+
+                 # ── Distributed ──
+                 sync_batch_norm: bool = False,
+
+                 # ── Reproducibility ──
                  seed: int = 42,
                  deterministic: bool = False,
                  tf32: Union[bool, str] = False,
                  cudnn_benchmark: bool = False,
 
+                 # ── Logging ──
                  project_dir: str = "outputs",
-                 project_name: str = "",
-                 run_config: Optional[Dict[str, Any]] = None,
                  log_with: Union[str, List[str], None] = None,
-                 log_config: Optional[Dict[str, Any]] = None,
+
+                 # ── Config dicts (config values override named args) ──
+                 dataloader_config: Optional[Dict[str, Any]] = None,
+                 optimizer_config: Optional[Dict[str, Any]] = None,
+                 accelerator_config: Optional[Dict[str, Any]] = None,
+                 tracker_config: Optional[Dict[str, Any]] = None,
                  ):
 
         self.model = model
@@ -84,27 +97,19 @@ class Engine:
         self.val_start = val_start
         self.val_interval = val_interval
 
-        self.optimizer_config = optimizer_config or {}
-        self.optimizers = []
-        self.schedulers = []
-        self.monitor = {}
-
         self.stage = stage
+
         self.train_batch_size = train_batch_size
         self.eval_batch_size = eval_batch_size
-        self.dataloader_config = dataloader_config or {}
-        self.train_dataloader = None
-        self.val_dataloader = None
-        self.test_dataloader = None
-        self.predict_dataloader = None
 
-        self.mixed_precision = mixed_precision
         self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.compile = compile
         self.gradient_clip_value = gradient_clip_value
         self.gradient_clip_algorithm = gradient_clip_algorithm.lower()
+
+        self.mixed_precision = mixed_precision
+        self.compile = compile
+
         self.sync_batch_norm = sync_batch_norm
-        self.accelerator_config = accelerator_config or {}
 
         self.seed = seed
         self.deterministic = deterministic
@@ -112,30 +117,68 @@ class Engine:
         self.cudnn_benchmark = cudnn_benchmark
 
         self.project_dir = project_dir
-        self.project_name = project_name
-        self.run_config = run_config or {}
         self.log_with = log_with
-        self.log_config = log_config or {}
 
-        self.setup_accelerator()
+        self.dataloader_config = dataloader_config or {}
+        self.optimizer_config = optimizer_config or {}
+        self.accelerator_config = accelerator_config or {}
+        self.tracker_config = tracker_config or {}
+        self.optimizers = []
+        self.schedulers = []
+        self.monitor = {}
+
+        self.train_dataloader = None
+        self.val_dataloader = None
+        self.test_dataloader = None
+        self.predict_dataloader = None
+
         self.setup_globals()
+        self.setup_accelerator()
         self.setup_data()
-        self._resolve_steps_per_epoch()
-        self._resolve_loop_limits()
         self.setup_model()
+
+
+    # ------------------------------------------------------------------
+    # Setup: globals
+    # ------------------------------------------------------------------
+
+    def setup_globals(self):
+        if self.deterministic:
+            if self.cudnn_benchmark:
+                logger.warning("cudnn_benchmark cannot be True if deterministic is True. Disabling benchmark.")
+                self.cudnn_benchmark = False
+
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+            torch.use_deterministic_algorithms(True)
+            torch.backends.cudnn.deterministic = True
+
+        if self.cudnn_benchmark:
+            torch.backends.cudnn.benchmark = True
+
+        if self.tf32:
+            precision = self.tf32 if isinstance(self.tf32, str) else "high"
+            torch.set_float32_matmul_precision(precision)
 
     # ------------------------------------------------------------------
     # Setup: accelerator
     # ------------------------------------------------------------------
 
     def setup_accelerator(self):
-        accelerator_kwargs = {
+        named_accelerator_args = {
             "project_dir": self.project_dir,
             "log_with": self.log_with,
             "gradient_accumulation_steps": self.gradient_accumulation_steps,
             "mixed_precision": self.mixed_precision,
         }
 
+        overlap = set(self.accelerator_config.keys()) & set(named_accelerator_args.keys())
+        if overlap:
+            logger.warning(
+                f"accelerator_config keys {overlap} overlap with named arguments. "
+                f"accelerator_config values take precedence."
+            )
+
+        accelerator_kwargs = named_accelerator_args.copy()
         accelerator_kwargs.update(self.accelerator_config)
 
         if self.compile and "dynamo_plugin" not in accelerator_kwargs:
@@ -148,35 +191,10 @@ class Engine:
             accelerator_kwargs["dynamo_plugin"] = dynamo_plugin
 
         self.accelerator = Accelerator(**accelerator_kwargs)
-
-        if self.log_with and self.accelerator.is_main_process:
-            self.accelerator.init_trackers(
-                project_name=self.project_name,
-                config=self.run_config,
-                init_kwargs=self.log_config
-            )
-
-    # ------------------------------------------------------------------
-    # Setup: globals
-    # ------------------------------------------------------------------
-
-    def setup_globals(self):
         set_seed(self.seed, device_specific=True)
 
-        if self.deterministic:
-            if self.cudnn_benchmark:
-                logger.warning("cudnn_benchmark cannot be True if deterministic is True. Disabling benchmark.")
-                self.cudnn_benchmark = False
-
-            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-            torch.use_deterministic_algorithms(True)
-
-        if self.cudnn_benchmark:
-            torch.backends.cudnn.benchmark = True
-
-        if self.tf32:
-            precision = self.tf32 if isinstance(self.tf32, str) else "high"
-            torch.set_float32_matmul_precision(precision)
+        if self.log_with and self.accelerator.is_main_process:
+            self.accelerator.init_trackers(**self.tracker_config)
 
     # ------------------------------------------------------------------
     # Setup: data
@@ -186,17 +204,12 @@ class Engine:
         if self.data is None:
             return
 
-        if hasattr(self.data, "prepare"):
+        if type(self.data).prepare is not Data.prepare:
             if self.accelerator.is_main_process:
                 self.data.prepare()
             self.accelerator.wait_for_everyone()
 
-        if hasattr(self.data, "setup"):
-            sig = inspect.signature(self.data.setup)
-            if 'stage' in sig.parameters:
-                self.data.setup(stage=self.stage)
-            else:
-                self.data.setup()
+        self.data.setup(stage=self.stage)
 
         loaders_to_prepare = []
         modes = []
@@ -221,13 +234,37 @@ class Engine:
             for i, mode in enumerate(modes):
                 setattr(self, f"{mode}_dataloader", prepared_loaders[i])
 
+        for mode in ["train", "val", "test", "predict"]:
+            if not getattr(self, f"do_{mode}"):
+                continue
+            attr_name = f"{mode}_steps_per_epoch"
+            if getattr(self, attr_name) is not None:
+                continue
+            loader = getattr(self, f"{mode}_dataloader")
+            if loader is None:
+                continue
+            try:
+                num = len(loader)
+                if mode == "train":
+                    num = math.ceil(num / self.gradient_accumulation_steps)
+                setattr(self, attr_name, num)
+            except TypeError:
+                pass
+
+        if self.do_train:
+            if self.max_epochs is None and self.max_steps is None:
+                raise ValueError("At least one of max_epochs or max_steps must be specified.")
+            if self.max_steps is None and self.max_epochs is not None:
+                if self.train_steps_per_epoch is not None:
+                    self.max_steps = self.max_epochs * self.train_steps_per_epoch
+
     def _get_dataloader_kwargs(self, mode: str) -> Dict[str, Any]:
-        kwargs = {
-            "batch_size": self.train_batch_size if mode == "train" else self.eval_batch_size
-        }
+        kwargs = {}
 
         if not self.dataloader_config:
-            return kwargs
+            return {
+                "batch_size": self.train_batch_size if mode == "train" else self.eval_batch_size
+            }
 
         mode_prefixes = ("train_", "val_", "test_", "predict_")
         for k, v in self.dataloader_config.items():
@@ -243,14 +280,14 @@ class Engine:
         if isinstance(section, dict):
             kwargs.update(section)
 
+        if "batch_size" not in kwargs:
+            kwargs["batch_size"] = self.train_batch_size if mode == "train" else self.eval_batch_size
+
         return kwargs
 
     def _fetch_loader(self, mode: str, kwargs: Dict[str, Any]) -> Any:
         method_name = f"{mode}_dataloader"
-        method = getattr(self.data, method_name, None)
-
-        if not method:
-            return None
+        method = getattr(self.data, method_name)
 
         sig = inspect.signature(method)
 
@@ -271,33 +308,6 @@ class Engine:
             return method(**valid_kwargs)
 
     # ------------------------------------------------------------------
-    # Setup: resolve steps per epoch + loop limits
-    # ------------------------------------------------------------------
-
-    def _resolve_steps_per_epoch(self):
-        for mode in ["train", "val", "test", "predict"]:
-            if not getattr(self, f"do_{mode}"):
-                continue
-            attr_name = f"{mode}_steps_per_epoch"
-            if getattr(self, attr_name) is not None:
-                continue
-            loader = getattr(self, f"{mode}_dataloader")
-            if loader is None:
-                continue
-            try:
-                setattr(self, attr_name, len(loader))
-            except TypeError:
-                pass
-
-    def _resolve_loop_limits(self):
-        if self.max_epochs is None and self.max_steps is None:
-            raise ValueError("At least one of max_epochs or max_steps must be specified.")
-
-        if self.max_steps is None and self.max_epochs is not None:
-            if self.train_steps_per_epoch is not None:
-                self.max_steps = self.max_epochs * self.train_steps_per_epoch
-
-    # ------------------------------------------------------------------
     # Setup: model + optimizers
     # ------------------------------------------------------------------
 
@@ -314,28 +324,27 @@ class Engine:
             logger.info("Converting model to SyncBatchNorm...")
             self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
 
-        configure_optim = getattr(self.model, "configure_optimizers", None)
-        if not configure_optim:
-            raise NotImplementedError("To train, you must implement `configure_optimizers()` in your Module.")
+        configure_optim = self.model.configure_optimizers
 
         sig = inspect.signature(configure_optim)
         accepts_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
 
-        if accepts_kwargs:
-            opt_conf = configure_optim(**self.optimizer_config)
-        else:
-            valid_kwargs = {k: v for k, v in self.optimizer_config.items() if k in sig.parameters}
-
-            dropped_keys = set(self.optimizer_config.keys()) - set(valid_kwargs.keys())
-            if dropped_keys:
-                logger.debug(
-                    f"Ignored kwargs for `configure_optimizers` because they are not in the signature: {dropped_keys}. "
-                    f"To use them, add `**kwargs` to your method definition."
-                )
-            opt_conf = configure_optim(**valid_kwargs)
-
-        if opt_conf is None:
-            raise ValueError("`configure_optimizers` returned None, but do_train=True.")
+        try:
+            if accepts_kwargs:
+                opt_conf = configure_optim(**self.optimizer_config)
+            else:
+                valid_kwargs = {k: v for k, v in self.optimizer_config.items() if k in sig.parameters}
+                dropped_keys = set(self.optimizer_config.keys()) - set(valid_kwargs.keys())
+                if dropped_keys:
+                    logger.debug(
+                        f"Ignored kwargs for `configure_optimizers` because they are not in the signature: {dropped_keys}. "
+                        f"To use them, add `**kwargs` to your method definition."
+                    )
+                opt_conf = configure_optim(**valid_kwargs)
+        except NotImplementedError:
+            raise NotImplementedError(
+                "To train, you must implement `configure_optimizers()` in your Module."
+            )
 
         self._standardize_optimizers(opt_conf)
 
@@ -361,32 +370,42 @@ class Engine:
     def _standardize_optimizers(self, opt_conf: Any):
         raw_optimizers = []
         raw_schedulers = []
-        common_config = {}
 
-        if isinstance(opt_conf, dict):
-            common_config = opt_conf.copy()
-            opt_input = common_config.pop('optimizer', None) or common_config.pop('optimizers', None)
-            if opt_input is None:
-                raise ValueError("Optimizer config dict must contain an 'optimizer' or 'optimizers' key.")
+        if isinstance(opt_conf, torch.optim.Optimizer):
+            raw_optimizers = [opt_conf]
 
-            raw_optimizers = opt_input if isinstance(opt_input, list) else [opt_input]
+        elif isinstance(opt_conf, dict):
+            if "optimizer" not in opt_conf:
+                raise ValueError("Dict must contain an 'optimizer' key.")
+            raw_optimizers = [opt_conf["optimizer"]]
+            if "scheduler" in opt_conf:
+                raw_schedulers = [opt_conf["scheduler"]]
 
-            sched_input = common_config.pop('scheduler', None) or common_config.pop('schedulers', None)
-            if sched_input is not None:
-                raw_schedulers = sched_input if isinstance(sched_input, list) else [sched_input]
+        elif isinstance(opt_conf, (list, tuple)):
+            if len(opt_conf) > 0 and isinstance(opt_conf[0], dict):
+                for d in opt_conf:
+                    if "optimizer" not in d:
+                        raise ValueError("Each dict must contain an 'optimizer' key.")
+                    raw_optimizers.append(d["optimizer"])
+                    if "scheduler" in d:
+                        raw_schedulers.append(d["scheduler"])
 
-        elif isinstance(opt_conf, tuple):
-            if len(opt_conf) != 2:
-                raise ValueError(f"Tuple config must be (Optimizers, Schedulers). Got length {len(opt_conf)}")
-            raw_optimizers = opt_conf[0] if isinstance(opt_conf[0], list) else [opt_conf[0]]
-            raw_schedulers = opt_conf[1] if isinstance(opt_conf[1], list) else [opt_conf[1]]
+            elif len(opt_conf) == 2 and isinstance(opt_conf[0], list):
+                raw_optimizers = opt_conf[0]
+                sched = opt_conf[1]
+                raw_schedulers = sched if isinstance(sched, list) else [sched]
+
+            else:
+                raw_optimizers = list(opt_conf)
 
         else:
-            raw_optimizers = opt_conf if isinstance(opt_conf, list) else [opt_conf]
+            raise TypeError(
+                f"Unsupported return type from configure_optimizers: {type(opt_conf).__name__}"
+            )
 
         for i, opt in enumerate(raw_optimizers):
             if not isinstance(opt, torch.optim.Optimizer):
-                raise TypeError(f"Expected torch.optim.Optimizer at index {i}, got {type(opt).__name__}")
+                raise TypeError(f"Expected Optimizer at index {i}, got {type(opt).__name__}")
             self.optimizers.append(opt)
 
         for sched_item in raw_schedulers:
@@ -403,12 +422,16 @@ class Engine:
 
             if isinstance(sched_item, dict):
                 if 'scheduler' not in sched_item:
-                    raise ValueError("Scheduler dictionary must contain a 'scheduler' key")
-                std_sched.update(common_config)
+                    raise ValueError("Scheduler config dict must contain a 'scheduler' key.")
                 std_sched.update(sched_item)
             else:
-                std_sched.update(common_config)
                 std_sched['scheduler'] = sched_item
+
+            if isinstance(std_sched['scheduler'], torch.optim.lr_scheduler.ReduceLROnPlateau):
+                if std_sched['monitor'] is None:
+                    raise ValueError(
+                        "ReduceLROnPlateau requires a 'monitor' key in the scheduler config."
+                    )
 
             self.schedulers.append(std_sched)
 
@@ -435,6 +458,14 @@ class Engine:
     @property
     def sync_gradients(self) -> bool:
         return self.accelerator.sync_gradients
+
+    @property
+    def use_distributed(self) -> bool:
+        return self.accelerator.use_distributed
+
+    @property
+    def local_process_index(self) -> int:
+        return self.accelerator.local_process_index
 
     # ------------------------------------------------------------------
     # Context managers + distributed utils
@@ -483,21 +514,22 @@ class Engine:
             else:
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.gradient_clip_value)
 
+    def optimizer_zero_grad(self, idx: int, set_to_none: bool = True):
+        self.optimizers[idx].zero_grad(set_to_none=set_to_none)
+
     def optimizers_zero_grad(self, set_to_none: bool = True):
         for opt in self.optimizers:
             opt.zero_grad(set_to_none=set_to_none)
+
+    def optimizer_step(self, idx: int):
+        self.optimizers[idx].step()
 
     def optimizers_step(self):
         for opt in self.optimizers:
             opt.step()
 
-    def schedulers_step(self, strategy: str, counter: int):
-        for sched_dict in self.schedulers:
-            if sched_dict['strategy'] == strategy:
-                if counter % sched_dict['interval'] == 0:
-                    self._execute_scheduler_step(sched_dict)
-
-    def _execute_scheduler_step(self, sched_dict: Dict[str, Any]):
+    def scheduler_step(self, idx: int):
+        sched_dict = self.schedulers[idx]
         scheduler = sched_dict['scheduler']
         monitor_key = sched_dict['monitor']
 
@@ -515,6 +547,12 @@ class Engine:
             scheduler.step(self.monitor[monitor_key])
         else:
             scheduler.step()
+
+    def schedulers_step(self, strategy: str, counter: int):
+        for i, sched_dict in enumerate(self.schedulers):
+            if sched_dict['strategy'] == strategy:
+                if counter % sched_dict['interval'] == 0:
+                    self.scheduler_step(i)
 
     # ------------------------------------------------------------------
     # Loop: run (orchestrator)
@@ -535,15 +573,17 @@ class Engine:
 
         epoch_idx = 0
         while self.max_epochs is None or epoch_idx < self.max_epochs:
+            self.model.train()
             self.on_train_epoch_start()
 
+            batch_idx = 0
             for batch in self.train_dataloader:
                 with self.accumulate():
                     self.optimizers_zero_grad()
-                    self.on_train_substep_start()
+                    self.on_train_substep_start(batch, batch_idx)
                     loss = self.train_step(batch)
                     self.backward(loss)
-                    self.on_train_substep_end()
+                    self.on_train_substep_end(loss, batch, batch_idx)
 
                     if self.sync_gradients:
                         self.clip_gradients()
@@ -562,6 +602,8 @@ class Engine:
                     if self.max_steps is not None and self.step >= self.max_steps:
                         break
 
+                batch_idx += 1
+
             self.on_train_epoch_end()
             self.epoch += 1
             self.schedulers_step(strategy="epoch", counter=self.epoch)
@@ -577,44 +619,53 @@ class Engine:
         self.on_train_end()
 
     def run_val(self):
+        self.model.eval()
         self.on_val_start()
         self.on_val_epoch_start()
         for batch_idx, batch in enumerate(self.val_dataloader):
             if self.val_steps_per_epoch is not None and batch_idx >= self.val_steps_per_epoch:
                 break
-            self.on_val_step_start()
-            metrics = self.val_step(batch)
-            if metrics:
-                self.monitor.update(metrics)
-            self.on_val_step_end()
+            self.on_val_step_start(batch, batch_idx)
+            outputs = self.val_step(batch)
+            self.on_val_step_end(outputs, batch, batch_idx)
         self.on_val_epoch_end()
         self.on_val_end()
 
     def run_test(self):
+        self.model.eval()
         self.on_test_start()
         self.on_test_epoch_start()
         for batch_idx, batch in enumerate(self.test_dataloader):
             if self.test_steps_per_epoch is not None and batch_idx >= self.test_steps_per_epoch:
                 break
-            self.on_test_step_start()
-            metrics = self.test_step(batch)
-            if metrics:
-                self.monitor.update(metrics)
-            self.on_test_step_end()
+            self.on_test_step_start(batch, batch_idx)
+            outputs = self.test_step(batch)
+            self.on_test_step_end(outputs, batch, batch_idx)
         self.on_test_epoch_end()
         self.on_test_end()
 
     def run_predict(self):
+        self.model.eval()
         self.on_predict_start()
         self.on_predict_epoch_start()
         for batch_idx, batch in enumerate(self.predict_dataloader):
             if self.predict_steps_per_epoch is not None and batch_idx >= self.predict_steps_per_epoch:
                 break
-            self.on_predict_step_start()
-            self.predict_step(batch)
-            self.on_predict_step_end()
+            self.on_predict_step_start(batch, batch_idx)
+            outputs = self.predict_step(batch)
+            self.on_predict_step_end(outputs, batch, batch_idx)
         self.on_predict_epoch_end()
         self.on_predict_end()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def should_validate(self) -> bool:
+        if not self.do_val:
+            return False
+        counter = self.step if self.val_strategy == "step" else self.epoch
+        return counter >= self.val_start and counter % self.val_interval == 0
 
     # ------------------------------------------------------------------
     # Step methods (user implements)
@@ -638,8 +689,8 @@ class Engine:
 
     def on_train_start(self): pass
     def on_train_epoch_start(self): pass
-    def on_train_substep_start(self): pass
-    def on_train_substep_end(self): pass
+    def on_train_substep_start(self, batch, batch_idx): pass
+    def on_train_substep_end(self, outputs, batch, batch_idx): pass
     def on_train_step_start(self): pass
     def on_train_step_end(self): pass
     def on_train_epoch_end(self): pass
@@ -647,31 +698,21 @@ class Engine:
 
     def on_val_start(self): pass
     def on_val_epoch_start(self): pass
-    def on_val_step_start(self): pass
-    def on_val_step_end(self): pass
+    def on_val_step_start(self, batch, batch_idx): pass
+    def on_val_step_end(self, outputs, batch, batch_idx): pass
     def on_val_epoch_end(self): pass
     def on_val_end(self): pass
 
     def on_test_start(self): pass
     def on_test_epoch_start(self): pass
-    def on_test_step_start(self): pass
-    def on_test_step_end(self): pass
+    def on_test_step_start(self, batch, batch_idx): pass
+    def on_test_step_end(self, outputs, batch, batch_idx): pass
     def on_test_epoch_end(self): pass
     def on_test_end(self): pass
 
     def on_predict_start(self): pass
     def on_predict_epoch_start(self): pass
-    def on_predict_step_start(self): pass
-    def on_predict_step_end(self): pass
+    def on_predict_step_start(self, batch, batch_idx): pass
+    def on_predict_step_end(self, outputs, batch, batch_idx): pass
     def on_predict_epoch_end(self): pass
     def on_predict_end(self): pass
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def should_validate(self) -> bool:
-        if not self.do_val:
-            return False
-        counter = self.step if self.val_strategy == "step" else self.epoch
-        return counter >= self.val_start and counter % self.val_interval == 0

@@ -7,4 +7,4 @@ class Model(nn.Module):
         super().__init__()
 
     def configure_optimizers(self):
-        return None
+        raise NotImplementedError
