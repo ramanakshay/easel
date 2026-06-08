@@ -21,10 +21,10 @@ class Engine:
                  model: Model,
 
                  # ── Mode flags ──
-                 do_train: bool = False,
-                 do_val: bool = False,
-                 do_test: bool = False,
-                 do_predict: bool = False,
+                 do_train: bool = True,
+                 do_val: bool = True,
+                 do_test: bool = True,
+                 do_predict: bool = True,
 
                  # ── Loop limits ──
                  max_epochs: Optional[int] = None,
@@ -38,6 +38,7 @@ class Engine:
                  val_strategy: str = "epoch",
                  val_start: int = 0,
                  val_interval: int = 1,
+                 val_at_end: bool = True,
 
                  # ── Stage ──
                  stage: Optional[str] = None,
@@ -96,6 +97,7 @@ class Engine:
         self.val_strategy = val_strategy
         self.val_start = val_start
         self.val_interval = val_interval
+        self.val_at_end = val_at_end
 
         self.stage = stage
 
@@ -224,6 +226,9 @@ class Engine:
                 if loader is not None:
                     loaders_to_prepare.append(loader)
                     modes.append(mode)
+
+                if loader is None:
+                    setattr(self, f"do_{mode}", False)
 
         if loaders_to_prepare:
             prepared_loaders = self.accelerator.prepare(*loaders_to_prepare)
@@ -561,7 +566,7 @@ class Engine:
     def run(self):
         if self.do_train:
             self.run_train()
-        if self.do_val:
+        if self.do_val and self.val_at_end:
             self.run_val()
         if self.do_test:
             self.run_test()
@@ -576,10 +581,10 @@ class Engine:
             self.model.train()
             self.on_train_epoch_start()
 
+            epoch_completed = True
             batch_idx = 0
-            for batch in self.train_dataloader:
+            for batch_idx, batch in enumerate(self.train_dataloader):
                 with self.accumulate():
-                    self.optimizers_zero_grad()
                     self.on_train_substep_start(batch, batch_idx)
                     loss = self.train_step(batch)
                     self.backward(loss)
@@ -600,16 +605,16 @@ class Engine:
                         self.run_val()
 
                     if self.max_steps is not None and self.step >= self.max_steps:
+                        epoch_completed = False
                         break
 
-                batch_idx += 1
+            if epoch_completed:
+                self.on_train_epoch_end()
+                self.epoch += 1
+                self.schedulers_step(strategy="epoch", counter=self.epoch)
 
-            self.on_train_epoch_end()
-            self.epoch += 1
-            self.schedulers_step(strategy="epoch", counter=self.epoch)
-
-            if self.val_strategy == "epoch" and self.should_validate():
-                self.run_val()
+                if self.val_strategy == "epoch" and self.should_validate():
+                    self.run_val()
 
             if self.max_steps is not None and self.step >= self.max_steps:
                 break
@@ -619,6 +624,8 @@ class Engine:
         self.on_train_end()
 
     def run_val(self):
+        if self.val_dataloader is None:
+            return
         self.model.eval()
         self.on_val_start()
         self.on_val_epoch_start()
@@ -626,12 +633,15 @@ class Engine:
             if self.val_steps_per_epoch is not None and batch_idx >= self.val_steps_per_epoch:
                 break
             self.on_val_step_start(batch, batch_idx)
-            outputs = self.val_step(batch)
+            with torch.no_grad():
+                outputs = self.val_step(batch)
             self.on_val_step_end(outputs, batch, batch_idx)
         self.on_val_epoch_end()
         self.on_val_end()
 
     def run_test(self):
+        if self.test_dataloader is None:
+            return
         self.model.eval()
         self.on_test_start()
         self.on_test_epoch_start()
@@ -639,12 +649,15 @@ class Engine:
             if self.test_steps_per_epoch is not None and batch_idx >= self.test_steps_per_epoch:
                 break
             self.on_test_step_start(batch, batch_idx)
-            outputs = self.test_step(batch)
+            with torch.no_grad():
+                outputs = self.test_step(batch)
             self.on_test_step_end(outputs, batch, batch_idx)
         self.on_test_epoch_end()
         self.on_test_end()
 
     def run_predict(self):
+        if self.predict_dataloader is None:
+            return
         self.model.eval()
         self.on_predict_start()
         self.on_predict_epoch_start()
@@ -652,7 +665,8 @@ class Engine:
             if self.predict_steps_per_epoch is not None and batch_idx >= self.predict_steps_per_epoch:
                 break
             self.on_predict_step_start(batch, batch_idx)
-            outputs = self.predict_step(batch)
+            with torch.no_grad():
+                outputs = self.predict_step(batch)
             self.on_predict_step_end(outputs, batch, batch_idx)
         self.on_predict_epoch_end()
         self.on_predict_end()
