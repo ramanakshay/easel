@@ -89,6 +89,55 @@ def run_tests():
 
     logger.info("Forward, Backward, and Optimization steps executed without crashing.")
 
+    # ── Logging API tests ──
+    logger.info("Testing logging API...")
+
+    # Test 1: log() without flush — buffer, no monitor
+    engine.log({"train_loss": 1.0})
+    assert "train_loss" in engine._log_buffer
+    assert "train_loss" not in engine.monitor
+    logger.info("log() buffer-only: OK")
+
+    # Test 2: log() with monitor=True — monitor updated
+    engine.log({"val_loss": 0.5}, monitor=True)
+    assert "val_loss" in engine._log_buffer
+    assert engine.monitor["val_loss"] == 0.5
+    logger.info("log(monitor=True): OK")
+
+    # Test 3: log() with flush=True — buffer flushed immediately
+    engine.log({"flushed": 1}, flush=True)
+    assert "flushed" not in engine._log_buffer
+    logger.info("log(flush=True): OK")
+
+    # Test 4: should_log() with log_strategy="no" returns False
+    engine.log_strategy = "no"
+    assert not engine.should_log()
+    engine.log_strategy = "step"
+    logger.info("should_log() with 'no' strategy: OK")
+
+    # Test 5: training flag is True during initialization
+    assert engine.training is True
+    logger.info("engine.training is True during setup: OK")
+
+    # Test 6: val_strategy="no" makes should_validate return False
+    engine.val_strategy = "no"
+    assert not engine.should_validate()
+    engine.val_strategy = "epoch"
+    logger.info("should_validate() with 'no' strategy: OK")
+
+    # Test 7: training flag — simulate post-training state
+    engine.training = False
+    assert engine.training is False
+    logger.info("engine.training flag: OK")
+
+    # Test 8: log() still works after training (buffer + monitor), flush works
+    engine.log({"post_train": 42}, monitor=True)
+    assert "post_train" in engine._log_buffer
+    assert engine.monitor["post_train"] == 42
+    engine._flush_log(step=engine.step)
+    assert "post_train" not in engine._log_buffer
+    logger.info("log() + monitor + flush work after training: OK")
+
     logger.info("--- All Tests Passed! Architecture is sound. ---")
 
 

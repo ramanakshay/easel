@@ -38,7 +38,11 @@ class Engine:
                  val_strategy: str = "epoch",
                  val_start: int = 0,
                  val_interval: int = 1,
-                 val_at_end: bool = True,
+
+                 # ── Logging ──
+                 log_strategy: str = "step",
+                 log_start: int = 0,
+                 log_interval: int = 1,
 
                  # ── Stage ──
                  stage: Optional[str] = None,
@@ -97,7 +101,12 @@ class Engine:
         self.val_strategy = val_strategy
         self.val_start = val_start
         self.val_interval = val_interval
-        self.val_at_end = val_at_end
+
+        self.log_strategy = log_strategy
+        self.log_start = log_start
+        self.log_interval = log_interval
+        self._log_buffer: Dict[str, Any] = {}
+        self.training = True
 
         self.stage = stage
 
@@ -488,8 +497,27 @@ class Engine:
     def print(self, *args, **kwargs):
         self.accelerator.print(*args, **kwargs)
 
-    def log(self, values: Dict[str, Any], step: Optional[int] = None):
-        self.accelerator.log(values, step=step)
+    # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
+
+    def log(self, values: Dict[str, Any], monitor: bool = False, flush: bool = False):
+        self._log_buffer.update(values)
+        if monitor:
+            self.monitor.update(values)
+        if flush:
+            self._flush_log(step=self.step)
+
+    def should_log(self) -> bool:
+        if self.log_strategy == "no":
+            return False
+        counter = self.step if self.log_strategy == "step" else self.epoch
+        return counter >= self.log_start and counter % self.log_interval == 0
+
+    def _flush_log(self, step: Optional[int] = None):
+        if self._log_buffer:
+            self.accelerator.log(self._log_buffer, step=step)
+            self._log_buffer.clear()
 
     def gather(self, tensor: torch.Tensor) -> torch.Tensor:
         return self.accelerator.gather(tensor)
@@ -566,8 +594,6 @@ class Engine:
     def run(self):
         if self.do_train:
             self.run_train()
-        if self.do_val and self.val_at_end:
-            self.run_val()
         if self.do_test:
             self.run_test()
         if self.do_predict:
@@ -604,6 +630,9 @@ class Engine:
                     if self.val_strategy == "step" and self.should_validate():
                         self.run_val()
 
+                    if self.log_strategy == "step" and self.should_log():
+                        self._flush_log(step=self.step)
+
                     if self.max_steps is not None and self.step >= self.max_steps:
                         epoch_completed = False
                         break
@@ -616,11 +645,15 @@ class Engine:
                 if self.val_strategy == "epoch" and self.should_validate():
                     self.run_val()
 
+                if self.log_strategy == "epoch" and self.should_log():
+                    self._flush_log(step=self.step)
+
             if self.max_steps is not None and self.step >= self.max_steps:
                 break
 
             epoch_idx += 1
 
+        self.training = False
         self.on_train_end()
 
     def run_val(self):
@@ -676,7 +709,7 @@ class Engine:
     # ------------------------------------------------------------------
 
     def should_validate(self) -> bool:
-        if not self.do_val:
+        if not self.do_val or self.val_strategy == "no":
             return False
         counter = self.step if self.val_strategy == "step" else self.epoch
         return counter >= self.val_start and counter % self.val_interval == 0
