@@ -7,4 +7,6 @@ class Model(nn.Module):
         super().__init__()
 
     def configure_optimizers(self):
-        raise NotImplementedError
+        raise NotImplementedError(
+            "configure_optimizers must be implemented in your Model subclass."
+        )
