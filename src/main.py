@@ -373,6 +373,19 @@ def test_optimizers_reduce_on_plateau_no_monitor_raises():
         pass
 
 
+def test_optimizers_none_with_do_train_raises():
+    class NoOpt(Model):
+        def forward(self, x):
+            return x
+        def configure_optimizers(self):
+            return None
+    try:
+        Engine(model=NoOpt(), data=DummyData(), train_batch_size=4, max_epochs=1, seed=42)
+        assert False, "Expected ValueError"
+    except ValueError:
+        pass
+
+
 # ──────────────────────────────────────────────
 # 7. Training primitives
 # ──────────────────────────────────────────────
@@ -404,7 +417,8 @@ def test_backward_and_step():
     loss = nn.functional.mse_loss(preds, y)
     engine.backward(loss)
     engine.optimizers_step()
-    engine.schedulers_step(strategy="epoch", counter=1)
+    engine.epoch = 1
+    engine.schedulers_step(strategy="epoch")
 
 
 def test_gather_and_reduce():
@@ -447,15 +461,17 @@ def test_schedulers_step_filters_by_strategy():
     assert len(engine.schedulers) == 1
     engine.schedulers[0]['strategy'] = "step"
     engine.schedulers[0]['interval'] = 1
-    engine.schedulers_step(strategy="epoch", counter=1)
+    engine.schedulers_step(strategy="epoch")
 
 
 def test_schedulers_step_interval_skips():
     engine = make_linear_engine()
     engine.schedulers[0]['strategy'] = "epoch"
     engine.schedulers[0]['interval'] = 2
-    engine.schedulers_step(strategy="epoch", counter=1)
-    engine.schedulers_step(strategy="epoch", counter=2)
+    engine.epoch = 1
+    engine.schedulers_step(strategy="epoch")
+    engine.epoch = 2
+    engine.schedulers_step(strategy="epoch")
 
 
 # ──────────────────────────────────────────────
@@ -706,6 +722,7 @@ def run_all():
         ("optconf  : list of dicts",                     test_optimizers_list_of_dicts),
         ("optconf  : None return",                       test_optimizers_none),
         ("optconf  : plateau no monitor raises",         test_optimizers_reduce_on_plateau_no_monitor_raises),
+        ("optconf  : None with do_train raises",         test_optimizers_none_with_do_train_raises),
         ("", None),
         ("primitiv : clip none is noop",                 test_clip_gradients_none_is_noop),
         ("primitiv : clip with value",                   test_clip_gradients_with_value),

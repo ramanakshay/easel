@@ -120,6 +120,7 @@ class Engine:
         self.accelerator_config = accelerator_config or {}
         self.init_trackers_config = init_trackers_config or {}
 
+        # TODO: think of the best way to manage config key + named arguments
         named_tracker_args = {"project_name": self.project_name}
         overlap = set(self.init_trackers_config.keys()) & set(named_tracker_args.keys())
         if overlap:
@@ -131,6 +132,7 @@ class Engine:
         self.optimizers = []
         self.schedulers = []
         self.monitor = {}
+        self.should_stop = False
 
         self.train_dataloader = None
         self.val_dataloader = None
@@ -360,6 +362,11 @@ class Engine:
 
         self._standardize_optimizers(opt_conf)
 
+        if not self.optimizers:
+            raise ValueError(
+                "do_train=True requires at least one optimizer from configure_optimizers."
+            )
+
         to_prepare = [self.model] + self.optimizers + [s['scheduler'] for s in self.schedulers]
 
         prepared_objs = self.accelerator.prepare(*to_prepare)
@@ -530,7 +537,7 @@ class Engine:
         self.accelerator.backward(loss, **kwargs)
 
     def clip_gradients(self):
-        if self.sync_gradients and self.gradient_clip_value is not None:
+        if self.gradient_clip_value is not None:
             if self.gradient_clip_algorithm == "value":
                 self.accelerator.clip_grad_value_(self.model.parameters(), self.gradient_clip_value)
             else:
@@ -564,7 +571,8 @@ class Engine:
         else:
             sched_dict['scheduler'].step()
 
-    def schedulers_step(self, strategy: str, counter: int):
+    def schedulers_step(self, strategy: str):
+        counter = self.step if strategy == "step" else self.epoch
         for i, sched_dict in enumerate(self.schedulers):
             if sched_dict['strategy'] == strategy:
                 if counter % sched_dict['interval'] == 0:
@@ -610,7 +618,7 @@ class Engine:
                     self.optimizers_step()
                     self.optimizers_zero_grad()
                     self.step += 1
-                    self.schedulers_step(strategy="step", counter=self.step)
+                    self.schedulers_step(strategy="step")
                     self.on_train_step_end()
 
                     if self.val_strategy == "step" and self.should_validate():
@@ -628,7 +636,7 @@ class Engine:
             if epoch_completed:
                 self.on_train_epoch_end()
                 self.epoch += 1
-                self.schedulers_step(strategy="epoch", counter=self.epoch)
+                self.schedulers_step(strategy="epoch")
 
                 if self.val_strategy == "epoch" and self.should_validate():
                     self.run_val()
@@ -639,7 +647,6 @@ class Engine:
 
             epoch_idx += 1
 
-        self.training = False
         self.on_train_end()
 
     def run_val(self):
