@@ -592,6 +592,24 @@ def test_loop_updates_lr_scheduler():
     assert lr_after != lr_before, f"LR did not change: {lr_before} -> {lr_after}"
 
 
+def test_should_stop_breaks_loop():
+    class StopEngine(Engine):
+        def train_step(self, batch):
+            x, y = batch
+            preds = self.model(x)
+            return nn.functional.mse_loss(preds, y)
+
+        def on_train_step_end(self):
+            if self.step >= 3:
+                self.should_stop = True
+
+    data = DummyData()
+    model = LinearModel()
+    engine = StopEngine(model=model, data=data, train_batch_size=32, seed=42, max_steps=10)
+    engine.run_train()
+    assert engine.step == 3, f"Step was {engine.step}, expected 3"
+
+
 # ──────────────────────────────────────────────
 # 11. Standalone eval / predict
 # ──────────────────────────────────────────────
@@ -677,6 +695,35 @@ def test_project_dir_created():
 
 
 # ──────────────────────────────────────────────
+# 13. run() orchestrator
+# ──────────────────────────────────────────────
+
+def test_val_always_runs_after_training():
+    class TrainValEngine(Engine):
+        val_count = 0
+
+        def train_step(self, batch):
+            x, y = batch
+            preds = self.model(x)
+            return nn.functional.mse_loss(preds, y)
+
+        def val_step(self, batch):
+            x, y = batch
+            preds = self.model(x)
+            return {"val_loss": nn.functional.mse_loss(preds, y)}
+
+        def on_val_start(self):
+            TrainValEngine.val_count += 1
+
+    data = DummyData()
+    model = LinearModel()
+    TrainValEngine.val_count = 0
+    engine = TrainValEngine(model=model, data=data, train_batch_size=32, seed=42, max_epochs=2, val_strategy="no", do_test=False, do_predict=False)
+    engine.run()
+    assert TrainValEngine.val_count >= 1, "Val should run after training even with val_strategy='no'"
+
+
+# ──────────────────────────────────────────────
 # Runner
 # ──────────────────────────────────────────────
 
@@ -744,10 +791,13 @@ def run_all():
         ("loop     : full training",                     test_full_training_loop),
         ("loop     : stops at max_steps",                test_training_loop_stops_at_max_steps),
         ("loop     : lr scheduler steps",                test_loop_updates_lr_scheduler),
+        ("loop     : should_stop breaks loop",           test_should_stop_breaks_loop),
         ("", None),
         ("standalon: run_val",                           test_standalone_val),
         ("standalon: run_test",                          test_standalone_test),
         ("standalon: run_predict",                       test_standalone_predict),
+        ("", None),
+        ("run()    : val always runs after training",    test_val_always_runs_after_training),
         ("", None),
         ("edge     : both max_epochs+max_steps set",     test_max_epochs_and_max_steps_both_set),
         ("edge     : grad accum config",                 test_gradient_accumulation_config),

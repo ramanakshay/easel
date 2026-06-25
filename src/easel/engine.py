@@ -30,9 +30,9 @@ class Engine:
                  max_epochs: Optional[int] = None,
                  max_steps: Optional[int] = None,
                  train_steps_per_epoch: Optional[int] = None,
-                 val_steps_per_epoch: Optional[int] = None,
-                 test_steps_per_epoch: Optional[int] = None,
-                 predict_steps_per_epoch: Optional[int] = None,
+                 val_steps: Optional[int] = None,
+                 test_steps: Optional[int] = None,
+                 predict_steps: Optional[int] = None,
 
                  # ── Validation ──
                  val_strategy: str = "epoch",
@@ -81,9 +81,9 @@ class Engine:
         self.max_epochs = max_epochs
         self.max_steps = max_steps
         self.train_steps_per_epoch = train_steps_per_epoch
-        self.val_steps_per_epoch = val_steps_per_epoch
-        self.test_steps_per_epoch = test_steps_per_epoch
-        self.predict_steps_per_epoch = predict_steps_per_epoch
+        self.val_steps = val_steps
+        self.test_steps = test_steps
+        self.predict_steps = predict_steps
 
         self.step = 0
         self.epoch = 0
@@ -253,7 +253,7 @@ class Engine:
         for mode in ["train", "val", "test", "predict"]:
             if not getattr(self, f"do_{mode}"):
                 continue
-            attr_name = f"{mode}_steps_per_epoch"
+            attr_name = f"{mode}_steps_per_epoch" if mode == "train" else f"{mode}_steps"
             if getattr(self, attr_name) is not None:
                 continue
             loader = getattr(self, f"{mode}_dataloader")
@@ -579,13 +579,23 @@ class Engine:
                     self.scheduler_step(i)
 
     # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def should_validate(self) -> bool:
+        if not self.do_val or self.val_strategy == "no":
+            return False
+        counter = self.step if self.val_strategy == "step" else self.epoch
+        return counter >= self.val_start and counter % self.val_interval == 0
+
+    # ------------------------------------------------------------------
     # Loop: run (orchestrator)
     # ------------------------------------------------------------------
 
     def run(self):
         if self.do_train:
             self.run_train()
-        elif self.do_val:
+        if self.do_val:
             self.run_val()
         if self.do_test:
             self.run_test()
@@ -625,7 +635,7 @@ class Engine:
                         self.run_val()
                         self.model.train()
 
-                    if self.max_steps is not None and self.step >= self.max_steps:
+                    if self.should_stop or (self.max_steps is not None and self.step >= self.max_steps):
                         epoch_completed = False
                         break
 
@@ -642,7 +652,7 @@ class Engine:
                     self.run_val()
                     self.model.train()
 
-            if self.max_steps is not None and self.step >= self.max_steps:
+            if self.should_stop or (self.max_steps is not None and self.step >= self.max_steps):
                 break
 
             epoch_idx += 1
@@ -654,15 +664,13 @@ class Engine:
             return
         self.model.eval()
         self.on_val_start()
-        self.on_val_epoch_start()
         for batch_idx, batch in enumerate(self.val_dataloader):
-            if self.val_steps_per_epoch is not None and batch_idx >= self.val_steps_per_epoch:
+            if self.val_steps is not None and batch_idx >= self.val_steps:
                 break
             self.on_val_step_start(batch, batch_idx)
             with torch.no_grad():
                 outputs = self.val_step(batch)
             self.on_val_step_end(outputs, batch, batch_idx)
-        self.on_val_epoch_end()
         self.on_val_end()
 
     def run_test(self):
@@ -670,15 +678,13 @@ class Engine:
             return
         self.model.eval()
         self.on_test_start()
-        self.on_test_epoch_start()
         for batch_idx, batch in enumerate(self.test_dataloader):
-            if self.test_steps_per_epoch is not None and batch_idx >= self.test_steps_per_epoch:
+            if self.test_steps is not None and batch_idx >= self.test_steps:
                 break
             self.on_test_step_start(batch, batch_idx)
             with torch.no_grad():
                 outputs = self.test_step(batch)
             self.on_test_step_end(outputs, batch, batch_idx)
-        self.on_test_epoch_end()
         self.on_test_end()
 
     def run_predict(self):
@@ -686,26 +692,14 @@ class Engine:
             return
         self.model.eval()
         self.on_predict_start()
-        self.on_predict_epoch_start()
         for batch_idx, batch in enumerate(self.predict_dataloader):
-            if self.predict_steps_per_epoch is not None and batch_idx >= self.predict_steps_per_epoch:
+            if self.predict_steps is not None and batch_idx >= self.predict_steps:
                 break
             self.on_predict_step_start(batch, batch_idx)
             with torch.no_grad():
                 outputs = self.predict_step(batch)
             self.on_predict_step_end(outputs, batch, batch_idx)
-        self.on_predict_epoch_end()
         self.on_predict_end()
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def should_validate(self) -> bool:
-        if not self.do_val or self.val_strategy == "no":
-            return False
-        counter = self.step if self.val_strategy == "step" else self.epoch
-        return counter >= self.val_start and counter % self.val_interval == 0
 
     # ------------------------------------------------------------------
     # Step methods (user implements)
@@ -737,22 +731,16 @@ class Engine:
     def on_train_end(self): pass
 
     def on_val_start(self): pass
-    def on_val_epoch_start(self): pass
     def on_val_step_start(self, batch, batch_idx): pass
     def on_val_step_end(self, outputs, batch, batch_idx): pass
-    def on_val_epoch_end(self): pass
     def on_val_end(self): pass
 
     def on_test_start(self): pass
-    def on_test_epoch_start(self): pass
     def on_test_step_start(self, batch, batch_idx): pass
     def on_test_step_end(self, outputs, batch, batch_idx): pass
-    def on_test_epoch_end(self): pass
     def on_test_end(self): pass
 
     def on_predict_start(self): pass
-    def on_predict_epoch_start(self): pass
     def on_predict_step_start(self, batch, batch_idx): pass
     def on_predict_step_end(self, outputs, batch, batch_idx): pass
-    def on_predict_epoch_end(self): pass
     def on_predict_end(self): pass
