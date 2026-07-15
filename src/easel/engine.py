@@ -1,3 +1,13 @@
+"""Easel Supervised Learning Engine.
+
+This module defines the :class:`Engine` class, which orchestrates the full
+machine learning lifecycle: training, validation, testing, and prediction.
+
+Public objects:
+    Engine: Orchestrates the training, validation, testing, and prediction
+        loops.
+"""
+
 import os
 import inspect
 import logging
@@ -16,6 +26,38 @@ logger = logging.getLogger(__name__)
 
 
 class Engine:
+    """Orchestrates the training, validation, testing, and prediction loops.
+
+    Subclass :class:`Engine`, implement the ``*_step`` methods
+    (:meth:`train_step`, :meth:`val_step`, :meth:`test_step`,
+    :meth:`predict_step`), and optionally override any of the lifecycle
+    hooks (``on_*``). Then construct the engine and call :meth:`run`.
+
+    The engine wraps HuggingFace ``accelerate`` for device placement,
+    distributed training, mixed precision, gradient accumulation, and
+    experiment tracking. The :class:`~easel.data.Data` object provides
+    dataloaders and the :class:`~easel.model.Model` provides the network
+    and optimizer configuration.
+
+    Key attributes:
+        model: The (possibly wrapped) :class:`~torch.nn.Module` being trained.
+        data: The :class:`~easel.data.Data` instance providing dataloaders.
+        accelerator: The underlying ``accelerate.Accerator`` instance.
+        optimizers: List of prepared optimizers.
+        schedulers: List of scheduler config dicts with keys ``scheduler``,
+            ``strategy``, ``interval``, ``monitor``.
+        monitor: Dict populated by the user for schedulers
+            that need a monitored metric value.
+        step: Global optimizer-step count (incremented after each gradient
+            sync boundary).
+        epoch: Current epoch index (incremented at epoch end).
+        should_stop: Set to ``True`` from a hook to early-stop training.
+        train_dataloader: Prepared training dataloader (or ``None``).
+        val_dataloader: Prepared validation dataloader (or ``None``).
+        test_dataloader: Prepared test dataloader (or ``None``).
+        predict_dataloader: Prepared prediction dataloader (or ``None``).
+    """
+
     def __init__(self,
                  data: Data,
                  model: Model,
@@ -69,6 +111,63 @@ class Engine:
                  tf32: Union[bool, str] = False,
                  cudnn_benchmark: bool = False,
                  ):
+        """Initialize the engine and run all setup phases.
+
+        Args:
+            data: The :class:`~easel.data.Data` instance providing dataloaders.
+            model: The :class:`~easel.model.Model` instance to train or evaluate.
+            do_train: Whether to run the training loop.
+            do_val: Whether to run the validation loop.
+            do_test: Whether to run the testing loop.
+            do_predict: Whether to run the prediction loop.
+            max_epochs: Maximum number of epochs to train. Required if
+                ``max_steps`` is ``None`` and ``do_train`` is ``True``.
+            max_steps: Maximum number of optimizer steps to train. If both
+                ``max_epochs`` and ``max_steps`` are set, ``max_steps`` wins
+                as the stop condition.
+            train_steps_per_epoch: Number of optimizer steps per epoch.
+                Auto-calculated from the dataloader length when not set.
+            val_steps: Maximum number of validation batches per run.
+            test_steps: Maximum number of test batches per run.
+            predict_steps: Maximum number of prediction batches per run.
+            val_strategy: When to run validation: ``"epoch"``, ``"step"``,
+                or ``"no"`` (validation disabled within training).
+            val_start: Step or epoch index at which validation begins.
+            val_interval: Run validation every ``val_interval`` steps or
+                epochs (depending on ``val_strategy``).
+            project_dir: Directory for accelerator outputs.
+            project_name: Experiment tracker project name.
+            log_with: Tracker(s) to log with (e.g. ``"wandb"``,
+                ``"tensorboard"``).
+            init_trackers_config: Extra config for ``accelerator.init_trackers``.
+            stage: Stage string forwarded to :meth:`Data.setup`.
+            train_batch_size: Default training batch size.
+            eval_batch_size: Default evaluation batch size.
+            dataloader_config: Per-mode or global dataloader kwargs. See
+                :meth:`_get_dataloader_kwargs` for the supported styles.
+            optimizers_config: Kwargs forwarded to
+                :meth:`Model.configure_optimizers`.
+            gradient_accumulation_steps: Number of micro-batches accumulated
+                per optimizer step.
+            gradient_clip_value: Value for gradient clipping (or ``None``).
+            gradient_clip_algorithm: ``"norm"`` or ``"value"``.
+            mixed_precision: ``"no"``, ``"fp16"``, ``"bf16"``, or ``"fp8"``.
+            compile: Whether to compile the model with ``torch.compile``.
+            sync_batch_norm: Whether to convert to ``SyncBatchNorm`` (multi-GPU).
+            accelerator_config: Extra kwargs forwarded to ``Accelerator``.
+            seed: Random seed for reproducibility (or ``None``).
+            deterministic: If ``True``, enable deterministic algorithms.
+            tf32: If truthy, enable TF32. A string sets the matmul precision
+                (``"high"`` or ``"medium"``); ``True`` uses ``"high"``.
+            cudnn_benchmark: If ``True``, enable ``cudnn.benchmark``.
+
+        Raises:
+            ValueError: If both ``max_epochs`` and ``max_steps`` are ``None``
+                while ``do_train=True``, or if ``max_epochs`` is set but the
+                train dataloader length is unknown (e.g. an
+                :class:`~torch.utils.data.IterableDataset`) and
+                ``train_steps_per_epoch`` was not provided.
+        """
 
         self.model = model
         self.data = data
@@ -120,7 +219,6 @@ class Engine:
         self.accelerator_config = accelerator_config or {}
         self.init_trackers_config = init_trackers_config or {}
 
-        # TODO: think of the best way to manage config key + named arguments
         named_tracker_args = {"project_name": self.project_name}
         overlap = set(self.init_trackers_config.keys()) & set(named_tracker_args.keys())
         if overlap:
@@ -149,7 +247,14 @@ class Engine:
     # Setup: globals
     # ------------------------------------------------------------------
 
-    def setup_globals(self):
+    def setup_globals(self) -> None:
+        """Configure global PyTorch flags for determinism and precision.
+
+        Sets deterministic algorithms, ``cudnn.benchmark``, and TF32 matmul
+        precision according to the corresponding constructor arguments.
+        Warns and disables ``cudnn_benchmark`` if both ``deterministic`` and
+        ``cudnn_benchmark`` were requested.
+        """
         if self.deterministic:
             if self.cudnn_benchmark:
                 logger.warning("cudnn_benchmark cannot be True if deterministic is True. Disabling benchmark.")
@@ -172,22 +277,29 @@ class Engine:
     # Setup: accelerator
     # ------------------------------------------------------------------
 
-    def setup_accelerator(self):
-        named_accelerator_args = {
+    def setup_accelerator(self) -> None:
+        """Construct and configure the ``accelerate.Accelerator``.
+
+        Merges named accelerator arguments with ``accelerator_config``
+        (the latter takes precedence, with a warning on overlap). Optionally
+        installs a TorchDynamo plugin when ``compile=True``. Seeds the
+        environment and initializes experiment trackers on the main process.
+        """
+        named_args = {
             "project_dir": self.project_dir,
             "log_with": self.log_with,
             "gradient_accumulation_steps": self.gradient_accumulation_steps,
             "mixed_precision": self.mixed_precision,
         }
 
-        overlap = set(self.accelerator_config.keys()) & set(named_accelerator_args.keys())
+        overlap = set(self.accelerator_config.keys()) & set(named_args.keys())
         if overlap:
             logger.warning(
                 f"accelerator_config keys {overlap} overlap with named arguments. "
                 f"accelerator_config values take precedence."
             )
 
-        accelerator_kwargs = named_accelerator_args.copy()
+        accelerator_kwargs = named_args.copy()
         accelerator_kwargs.update(self.accelerator_config)
 
         if self.compile and "dynamo_plugin" not in accelerator_kwargs:
@@ -204,17 +316,36 @@ class Engine:
             set_seed(self.seed, device_specific=True)
 
         if self.log_with and self.accelerator.is_main_process:
-            init_trackers_kwargs = self.init_trackers_config.copy()
-            project_name = init_trackers_kwargs.pop("project_name")
-            config = init_trackers_kwargs.pop("config", None)
-            init_kwargs = init_trackers_kwargs.pop("init_kwargs", None)
+            tracker_kwargs = self.init_trackers_config.copy()
+            project_name = tracker_kwargs.pop("project_name")
+            config = tracker_kwargs.pop("config", None)
+            init_kwargs = tracker_kwargs.pop("init_kwargs", None)
             self.accelerator.init_trackers(project_name, config=config, init_kwargs=init_kwargs)
 
     # ------------------------------------------------------------------
     # Setup: data
     # ------------------------------------------------------------------
 
-    def setup_data(self):
+    def setup_data(self) -> None:
+        """Prepare data, build dataloaders, and derive loop limits.
+
+        Runs :meth:`Data.prepare` on the main process, then calls
+        :meth:`Data.setup`. For each enabled mode, builds the corresponding
+        dataloader via :meth:`_fetch_loader`, prepares it with the
+        accelerator, and disables any mode whose dataloader is ``None``.
+
+        Auto-derives ``*_steps_per_epoch`` / ``*_steps`` from the dataloader
+        length when not explicitly set (training steps are divided by
+        ``gradient_accumulation_steps``). Reconciles ``max_epochs`` and
+        ``max_steps`` — at least one must be set when ``do_train=True``.
+
+        Raises:
+            ValueError: If both ``max_epochs`` and ``max_steps`` are ``None``
+                while ``do_train=True``, or if ``max_epochs`` is set but
+                the train dataloader length is unknown (e.g. an
+                :class:`~torch.utils.data.IterableDataset`) and
+                ``train_steps_per_epoch`` was not provided.
+        """
         if self.data is None:
             return
 
@@ -224,46 +355,45 @@ class Engine:
 
         self.data.setup(stage=self.stage)
 
-        loaders_to_prepare = []
-        modes = []
+        modes = ["train", "val", "test", "predict"]
+        enabled_modes = []
+        loaders = []
 
-        for mode in ["train", "val", "test", "predict"]:
-            if getattr(self, f"do_{mode}"):
-                kwargs = self._get_dataloader_kwargs(mode)
-                loader = self._fetch_loader(mode, kwargs)
-
-                setattr(self, f"{mode}_dataloader", loader)
-
-                if loader is not None:
-                    loaders_to_prepare.append(loader)
-                    modes.append(mode)
-
-                if loader is None:
-                    setattr(self, f"do_{mode}", False)
-
-        if loaders_to_prepare:
-            prepared_loaders = self.accelerator.prepare(*loaders_to_prepare)
-
-            if not isinstance(prepared_loaders, tuple):
-                prepared_loaders = (prepared_loaders,)
-
-            for i, mode in enumerate(modes):
-                setattr(self, f"{mode}_dataloader", prepared_loaders[i])
-
-        for mode in ["train", "val", "test", "predict"]:
+        for mode in modes:
             if not getattr(self, f"do_{mode}"):
                 continue
-            attr_name = f"{mode}_steps_per_epoch" if mode == "train" else f"{mode}_steps"
-            if getattr(self, attr_name) is not None:
+
+            kwargs = self._get_dataloader_kwargs(mode)
+            loader = self._fetch_loader(mode, kwargs)
+
+            if loader is None:
+                setattr(self, f"do_{mode}", False)
+            else:
+                setattr(self, f"{mode}_dataloader", loader)
+                enabled_modes.append(mode)
+                loaders.append(loader)
+
+        if loaders:
+            prepared = self.accelerator.prepare(*loaders)
+            if not isinstance(prepared, tuple):
+                prepared = (prepared,)
+            for i, mode in enumerate(enabled_modes):
+                setattr(self, f"{mode}_dataloader", prepared[i])
+
+        for mode in modes:
+            if not getattr(self, f"do_{mode}"):
+                continue
+            steps_attr = f"{mode}_steps_per_epoch" if mode == "train" else f"{mode}_steps"
+            if getattr(self, steps_attr) is not None:
                 continue
             loader = getattr(self, f"{mode}_dataloader")
             if loader is None:
                 continue
             try:
-                num = len(loader)
+                num_batches = len(loader)
                 if mode == "train":
-                    num = math.ceil(num / self.gradient_accumulation_steps)
-                setattr(self, attr_name, num)
+                    num_batches = math.ceil(num_batches / self.gradient_accumulation_steps)
+                setattr(self, steps_attr, num_batches)
             except TypeError:
                 pass
 
@@ -273,17 +403,44 @@ class Engine:
             if self.max_steps is None and self.max_epochs is not None:
                 if self.train_steps_per_epoch is not None:
                     self.max_steps = self.max_epochs * self.train_steps_per_epoch
+                else:
+                    raise ValueError(
+                        "Could not determine `train_steps_per_epoch` for the train dataloader "
+                        "(likely an IterableDataset). When using an iterable dataset, set "
+                        "`max_steps` explicitly, or pass `train_steps_per_epoch` so `max_epochs` "
+                        "can be converted to a step limit."
+                    )
             if self.max_epochs is None and self.max_steps is not None:
                 if self.train_steps_per_epoch is not None:
                     self.max_epochs = math.ceil(self.max_steps / self.train_steps_per_epoch)
 
     def _get_dataloader_kwargs(self, mode: str) -> Dict[str, Any]:
-        kwargs = {}
+        """Resolve dataloader kwargs for the given mode.
+
+        Supports three styles within ``dataloader_config``:
+
+        1. Global keys applied to all modes (e.g. ``{"shuffle": False}``).
+        2. Mode-prefixed keys (e.g. ``"train_num_workers"`` →
+           ``num_workers`` for the train loader only).
+        3. Per-mode sub-dicts (e.g. ``{"train": {"batch_size": 8}}``).
+
+        A ``batch_size`` default is always applied if not otherwise set:
+        ``train_batch_size`` for the train mode, ``eval_batch_size``
+        otherwise.
+
+        Args:
+            mode: One of ``"train"``, ``"val"``, ``"test"``, ``"predict"``.
+
+        Returns:
+            A dict of kwargs suitable for passing to the mode's
+            ``*_dataloader`` method.
+        """
+        default_batch_size = self.train_batch_size if mode == "train" else self.eval_batch_size
 
         if not self.dataloader_config:
-            return {
-                "batch_size": self.train_batch_size if mode == "train" else self.eval_batch_size
-            }
+            return {"batch_size": default_batch_size}
+
+        kwargs: Dict[str, Any] = {}
 
         mode_prefixes = ("train_", "val_", "test_", "predict_")
         for k, v in self.dataloader_config.items():
@@ -299,44 +456,64 @@ class Engine:
         if isinstance(section, dict):
             kwargs.update(section)
 
-        if "batch_size" not in kwargs:
-            kwargs["batch_size"] = self.train_batch_size if mode == "train" else self.eval_batch_size
-
+        kwargs.setdefault("batch_size", default_batch_size)
         return kwargs
 
     def _fetch_loader(self, mode: str, kwargs: Dict[str, Any]) -> Any:
+        """Call the ``<mode>_dataloader`` method on ``self.data``.
+
+        Introspects the method signature: if it accepts ``**kwargs``, all
+        kwargs are forwarded. Otherwise, only parameters the method declares
+        are passed, and dropped keys are logged at debug level.
+
+        Args:
+            mode: One of ``"train"``, ``"val"``, ``"test"``, ``"predict"``.
+            kwargs: Kwargs resolved by :meth:`_get_dataloader_kwargs`.
+
+        Returns:
+            The dataloader returned by the method, or ``None``.
+        """
         method_name = f"{mode}_dataloader"
         method = getattr(self.data, method_name)
 
         sig = inspect.signature(method)
-
-        accepts_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
+        accepts_kwargs = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
 
         if accepts_kwargs:
             return method(**kwargs)
-        else:
-            valid_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
 
-            dropped_keys = set(kwargs.keys()) - set(valid_kwargs.keys())
-            if dropped_keys:
-                logger.debug(
-                    f"Ignored kwargs for `{method_name}` because they are not in the signature: {dropped_keys}. "
-                    f"To use them, add `**kwargs` to your method definition."
-                )
-
-            return method(**valid_kwargs)
+        valid_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        dropped_keys = set(kwargs.keys()) - set(valid_kwargs.keys())
+        if dropped_keys:
+            logger.debug(
+                f"Ignored kwargs for `{method_name}` because they are not in the signature: {dropped_keys}. "
+                f"To use them, add `**kwargs` to your method definition."
+            )
+        return method(**valid_kwargs)
 
     # ------------------------------------------------------------------
     # Setup: model + optimizers
     # ------------------------------------------------------------------
 
-    def setup_model(self):
+    def setup_model(self) -> None:
+        """Prepare the model, optimizers, and schedulers for training.
+
+        If ``do_train=False``, only prepares the model for inference and
+        returns. Otherwise, optionally converts to ``SyncBatchNorm``, calls
+        ``model.configure_optimizers(**optimizers_config)``, normalizes the
+        return via :meth:`_standardize_optimizers`, and prepares the model,
+        optimizers, and schedulers with the accelerator.
+
+        Raises:
+            ValueError: If ``do_train=True`` but
+                :meth:`Model.configure_optimizers` returned no optimizers.
+        """
         if not self.do_train:
             logger.info("do_train=False. Skipping optimizers and preparing model for inference.")
-            prepared_objs = self.accelerator.prepare(self.model)
-            if not isinstance(prepared_objs, tuple):
-                prepared_objs = (prepared_objs,)
-            self.model = prepared_objs[0]
+            prepared = self.accelerator.prepare(self.model)
+            if not isinstance(prepared, tuple):
+                prepared = (prepared,)
+            self.model = prepared[0]
             return
 
         if self.sync_batch_norm and self.accelerator.num_processes > 1:
@@ -344,9 +521,8 @@ class Engine:
             self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
 
         configure_optim = self.model.configure_optimizers
-
         sig = inspect.signature(configure_optim)
-        accepts_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
+        accepts_kwargs = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
 
         if accepts_kwargs:
             opt_conf = configure_optim(**self.optimizers_config)
@@ -368,27 +544,57 @@ class Engine:
             )
 
         to_prepare = [self.model] + self.optimizers + [s['scheduler'] for s in self.schedulers]
+        prepared = self.accelerator.prepare(*to_prepare)
+        if not isinstance(prepared, tuple):
+            prepared = (prepared,)
 
-        prepared_objs = self.accelerator.prepare(*to_prepare)
+        self.model = prepared[0]
 
-        if not isinstance(prepared_objs, tuple):
-            prepared_objs = (prepared_objs,)
-
-        self.model = prepared_objs[0]
-
-        curr_idx = 1
+        # Splice the prepared optimizers and schedulers back out of the
+        # flat tuple returned by accelerator.prepare.
+        offset = 1
         if self.optimizers:
-            self.optimizers = list(prepared_objs[curr_idx: curr_idx + len(self.optimizers)])
-            curr_idx += len(self.optimizers)
+            self.optimizers = list(prepared[offset: offset + len(self.optimizers)])
+            offset += len(self.optimizers)
 
         if self.schedulers:
-            prepared_schedulers = prepared_objs[curr_idx:]
+            prepared_schedulers = prepared[offset:]
             for i, prep_sched in enumerate(prepared_schedulers):
                 self.schedulers[i]['scheduler'] = prep_sched
 
-    def _standardize_optimizers(self, opt_conf: Any):
-        raw_optimizers = []
-        raw_schedulers = []
+    def _standardize_optimizers(self, opt_conf: Any) -> None:
+        """Normalize the return of ``configure_optimizers`` into flat lists.
+
+        Populates ``self.optimizers`` and ``self.schedulers`` from any of the
+        supported return formats:
+
+        - ``None`` (inference only).
+        - A single :class:`~torch.optim.Optimizer`.
+        - A dict with an ``"optimizer"`` key and optional
+          ``"scheduler"`` / ``"lr_scheduler"`` key.
+        - A list of such dicts.
+        - A tuple ``(optimizers, schedulers)`` where each may be a single
+          object or a list.
+        - A plain list of optimizers (no schedulers).
+
+        Each scheduler is stored as a config dict with keys ``scheduler``,
+        ``strategy`` (``"epoch"`` by default), ``interval`` (``1`` by
+        default), and ``monitor`` (``None`` by default).
+
+        Args:
+            opt_conf: The raw return value from
+                :meth:`Model.configure_optimizers`.
+
+        Raises:
+            ValueError: If a dict is missing the ``"optimizer"`` key, if a
+                scheduler config dict is missing the ``"scheduler"`` key, or
+                if a ``ReduceLROnPlateau`` scheduler is given without a
+                ``monitor`` key.
+            TypeError: If ``opt_conf`` has an unsupported type, or if any
+                element expected to be an optimizer is not one.
+        """
+        raw_optimizers: List[Any] = []
+        raw_schedulers: List[Any] = []
 
         if opt_conf is None:
             pass
@@ -419,7 +625,9 @@ class Engine:
                     if scheduler is not None:
                         raw_schedulers.append(scheduler)
 
-            elif len(opt_conf) == 2 and isinstance(opt_conf[0], torch.optim.Optimizer):
+            elif (len(opt_conf) == 2
+                  and isinstance(opt_conf[0], torch.optim.Optimizer)
+                  and not isinstance(opt_conf[1], torch.optim.Optimizer)):
                 raw_optimizers = [opt_conf[0]]
                 sched = opt_conf[1]
                 raw_schedulers = [sched] if not isinstance(sched, list) else sched
@@ -441,7 +649,7 @@ class Engine:
             if sched_item is None:
                 continue
 
-            std_sched = {
+            std_sched: Dict[str, Any] = {
                 'scheduler': None,
                 'strategy': 'epoch',
                 'interval': 1,
@@ -469,30 +677,37 @@ class Engine:
 
     @property
     def raw_model(self) -> torch.nn.Module:
+        """The unwrapped model."""
         return self.accelerator.unwrap_model(self.model)
 
     @property
     def device(self) -> torch.device:
+        """The device used by the accelerator."""
         return self.accelerator.device
 
     @property
     def is_main_process(self) -> bool:
+        """Whether this process is the main process."""
         return self.accelerator.is_main_process
 
     @property
     def num_processes(self) -> int:
+        """Total number of processes."""
         return self.accelerator.num_processes
 
     @property
     def sync_gradients(self) -> bool:
+        """Whether gradients are being synced across processes right now."""
         return self.accelerator.sync_gradients
 
     @property
     def use_distributed(self) -> bool:
+        """Whether distributed training is in use."""
         return self.accelerator.use_distributed
 
     @property
     def local_process_index(self) -> int:
+        """Index of this process on the local machine."""
         return self.accelerator.local_process_index
 
     # ------------------------------------------------------------------
@@ -500,15 +715,19 @@ class Engine:
     # ------------------------------------------------------------------
 
     def autocast(self):
+        """Return the accelerator's autocast context manager."""
         return self.accelerator.autocast()
 
     def accumulate(self):
+        """Return the accelerator's gradient-accumulation context manager."""
         return self.accelerator.accumulate(self.model)
 
-    def wait(self):
+    def wait(self) -> None:
+        """Block until all processes reach this point."""
         self.accelerator.wait_for_everyone()
 
-    def print(self, *args, **kwargs):
+    def print(self, *args, **kwargs) -> None:
+        """Print only on the main process."""
         self.accelerator.print(*args, **kwargs)
 
     # ------------------------------------------------------------------
@@ -516,15 +735,27 @@ class Engine:
     # ------------------------------------------------------------------
 
     def gather(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Gather a tensor across all processes."""
         return self.accelerator.gather(tensor)
 
     def gather_for_metrics(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Gather a tensor across processes for metric computation."""
         return self.accelerator.gather_for_metrics(tensor)
 
     def reduce(self, tensor: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
+        """Reduce a tensor across processes.
+
+        Args:
+            tensor: The tensor to reduce.
+            reduction: One of ``"mean"``, ``"sum"``, or ``"none"``.
+
+        Returns:
+            The reduced tensor.
+        """
         return self.accelerator.reduce(tensor, reduction=reduction)
 
-    def free_memory(self):
+    def free_memory(self) -> None:
+        """Run garbage collection and empty the CUDA cache."""
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -533,31 +764,56 @@ class Engine:
     # Training primitives
     # ------------------------------------------------------------------
 
-    def backward(self, loss: torch.Tensor, **kwargs):
+    def backward(self, loss: torch.Tensor, **kwargs) -> None:
+        """Run the backward pass through the accelerator.
+
+        Args:
+            loss: The loss tensor to backpropagate.
+            **kwargs: Forwarded to ``accelerator.backward``.
+        """
         self.accelerator.backward(loss, **kwargs)
 
-    def clip_gradients(self):
-        if self.gradient_clip_value is not None:
-            if self.gradient_clip_algorithm == "value":
-                self.accelerator.clip_grad_value_(self.model.parameters(), self.gradient_clip_value)
-            else:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.gradient_clip_value)
+    def clip_gradients(self) -> None:
+        """Clip gradients if ``gradient_clip_value`` is set."""
+        if self.gradient_clip_value is None:
+            return
+        if self.gradient_clip_algorithm == "value":
+            self.accelerator.clip_grad_value_(self.model.parameters(), self.gradient_clip_value)
+        else:
+            self.accelerator.clip_grad_norm_(self.model.parameters(), self.gradient_clip_value)
 
-    def optimizer_zero_grad(self, idx: int, set_to_none: bool = True):
+    def optimizer_zero_grad(self, idx: int, set_to_none: bool = True) -> None:
+        """Zero gradients of the optimizer at ``idx``."""
         self.optimizers[idx].zero_grad(set_to_none=set_to_none)
 
-    def optimizers_zero_grad(self, set_to_none: bool = True):
+    def optimizers_zero_grad(self, set_to_none: bool = True) -> None:
+        """Zero gradients of all optimizers."""
         for opt in self.optimizers:
             opt.zero_grad(set_to_none=set_to_none)
 
-    def optimizer_step(self, idx: int):
+    def optimizer_step(self, idx: int) -> None:
+        """Step the optimizer at ``idx``."""
         self.optimizers[idx].step()
 
-    def optimizers_step(self):
+    def optimizers_step(self) -> None:
+        """Step all optimizers."""
         for opt in self.optimizers:
             opt.step()
 
-    def scheduler_step(self, idx: int):
+    def scheduler_step(self, idx: int) -> None:
+        """Step the scheduler at ``idx``.
+
+        If the scheduler config has a ``monitor`` key, the corresponding
+        value is read from :attr:`monitor` and passed to
+        ``scheduler.step(value)`` (required for ``ReduceLROnPlateau``).
+
+        Args:
+            idx: Index into :attr:`schedulers`.
+
+        Raises:
+            KeyError: If the scheduler expects a ``monitor`` key that is not
+                present in :attr:`monitor`.
+        """
         sched_dict = self.schedulers[idx]
         monitor_key = sched_dict['monitor']
 
@@ -571,7 +827,14 @@ class Engine:
         else:
             sched_dict['scheduler'].step()
 
-    def schedulers_step(self, strategy: str):
+    def schedulers_step(self, strategy: str) -> None:
+        """Step all schedulers matching the given strategy.
+
+        Args:
+            strategy: ``"step"`` or ``"epoch"``. Only schedulers whose
+                ``strategy`` matches are stepped, and only when the current
+                step/epoch counter is a multiple of their ``interval``.
+        """
         counter = self.step if strategy == "step" else self.epoch
         for i, sched_dict in enumerate(self.schedulers):
             if sched_dict['strategy'] == strategy:
@@ -583,6 +846,7 @@ class Engine:
     # ------------------------------------------------------------------
 
     def should_validate(self) -> bool:
+        """Return whether validation should run at the current step/epoch."""
         if not self.do_val or self.val_strategy == "no":
             return False
         counter = self.step if self.val_strategy == "step" else self.epoch
@@ -592,7 +856,8 @@ class Engine:
     # Loop: run (orchestrator)
     # ------------------------------------------------------------------
 
-    def run(self):
+    def run(self) -> None:
+        """Run training, validation, testing, and prediction as configured."""
         if self.do_train:
             self.run_train()
         if self.do_val:
@@ -602,11 +867,24 @@ class Engine:
         if self.do_predict:
             self.run_predict()
 
-    def run_train(self):
+    def run_train(self) -> None:
+        """Run the full training loop.
+
+        Iterates over epochs until ``max_epochs`` is reached or training is
+        early-stopped via :attr:`should_stop` or ``max_steps``. Within each
+        epoch, iterates over the training dataloader, accumulating gradients
+        and stepping optimizers/schedulers at gradient-sync boundaries.
+
+        Lifecycle hooks called (in order): ``on_train_start``,
+        ``on_train_epoch_start``, ``on_train_substep_start``,
+        ``on_train_substep_end``, ``on_train_step_start``,
+        ``on_train_step_end``, ``on_train_epoch_end``, ``on_train_end``.
+        Validation runs inline when :meth:`should_validate` is true.
+        """
         self.on_train_start()
 
-        epoch_idx = 0
-        while self.max_epochs is None or epoch_idx < self.max_epochs:
+        epoch = 0
+        while self.max_epochs is None or epoch < self.max_epochs:
             self.model.train()
             self.on_train_epoch_start()
 
@@ -616,9 +894,10 @@ class Engine:
                 has_batch = True
                 with self.accumulate():
                     self.on_train_substep_start(batch, batch_idx)
-                    loss = self.train_step(batch)
-                    self.backward(loss) # TODO: Also support dictionaries 'loss' key
-                    self.on_train_substep_end(loss, batch, batch_idx)
+                    outputs = self.train_step(batch)
+                    loss = outputs["loss"] if isinstance(outputs, dict) else outputs
+                    self.backward(loss)
+                    self.on_train_substep_end(outputs, batch, batch_idx)
 
                     if self.sync_gradients:
                         self.clip_gradients()
@@ -655,11 +934,18 @@ class Engine:
             if self.should_stop or (self.max_steps is not None and self.step >= self.max_steps):
                 break
 
-            epoch_idx += 1
+            epoch += 1
 
         self.on_train_end()
 
-    def run_val(self):
+    def run_val(self) -> None:
+        """Run the validation loop.
+
+        Iterates over the validation dataloader (up to ``val_steps`` batches),
+        calling :meth:`val_step` under ``torch.no_grad()``. Lifecycle hooks:
+        ``on_val_start``, ``on_val_step_start``, ``on_val_step_end``,
+        ``on_val_end``.
+        """
         if self.val_dataloader is None:
             return
         self.model.eval()
@@ -673,7 +959,14 @@ class Engine:
             self.on_val_step_end(outputs, batch, batch_idx)
         self.on_val_end()
 
-    def run_test(self):
+    def run_test(self) -> None:
+        """Run the testing loop.
+
+        Iterates over the test dataloader (up to ``test_steps`` batches),
+        calling :meth:`test_step` under ``torch.no_grad()``. Lifecycle hooks:
+        ``on_test_start``, ``on_test_step_start``, ``on_test_step_end``,
+        ``on_test_end``.
+        """
         if self.test_dataloader is None:
             return
         self.model.eval()
@@ -687,7 +980,14 @@ class Engine:
             self.on_test_step_end(outputs, batch, batch_idx)
         self.on_test_end()
 
-    def run_predict(self):
+    def run_predict(self) -> None:
+        """Run the prediction loop.
+
+        Iterates over the prediction dataloader (up to ``predict_steps``
+        batches), calling :meth:`predict_step` under ``torch.no_grad()``.
+        Lifecycle hooks: ``on_predict_start``, ``on_predict_step_start``,
+        ``on_predict_step_end``, ``on_predict_end``.
+        """
         if self.predict_dataloader is None:
             return
         self.model.eval()
@@ -706,41 +1006,191 @@ class Engine:
     # ------------------------------------------------------------------
 
     def train_step(self, batch) -> torch.Tensor:
+        """Compute and return the training loss for a batch.
+
+        May return either a loss tensor directly, or a dict containing at
+        least a ``"loss"`` key. When a dict is returned, the engine extracts
+        ``outputs["loss"]`` for the backward pass and forwards the full
+        ``outputs`` dict to :meth:`on_train_substep_end`.
+
+        Args:
+            batch: A batch from the training dataloader.
+
+        Returns:
+            The loss tensor, or a dict with a ``"loss"`` key.
+
+        Raises:
+            NotImplementedError: If not overridden in a subclass.
+        """
         raise NotImplementedError("train_step must be implemented to train.")
 
     def val_step(self, batch) -> Optional[Dict[str, Any]]:
+        """Compute and return validation outputs for a batch.
+
+        Args:
+            batch: A batch from the validation dataloader.
+
+        Returns:
+            A dict of outputs (e.g. ``{"val_loss": ...}``), or ``None``.
+
+        Raises:
+            NotImplementedError: If not overridden in a subclass.
+        """
         raise NotImplementedError("val_step must be implemented to validate.")
 
     def test_step(self, batch) -> Optional[Dict[str, Any]]:
+        """Compute and return test outputs for a batch.
+
+        Args:
+            batch: A batch from the test dataloader.
+
+        Returns:
+            A dict of outputs (e.g. ``{"test_loss": ...}``), or ``None``.
+
+        Raises:
+            NotImplementedError: If not overridden in a subclass.
+        """
         raise NotImplementedError("test_step must be implemented to test.")
 
     def predict_step(self, batch) -> Any:
+        """Compute and return predictions for a batch.
+
+        Args:
+            batch: A batch from the prediction dataloader.
+
+        Returns:
+            The model's predictions for the batch.
+
+        Raises:
+            NotImplementedError: If not overridden in a subclass.
+        """
         raise NotImplementedError("predict_step must be implemented to predict.")
 
     # ------------------------------------------------------------------
     # Lifecycle hooks (all no-ops by default)
     # ------------------------------------------------------------------
 
-    def on_train_start(self): pass
-    def on_train_epoch_start(self): pass
-    def on_train_substep_start(self, batch, batch_idx): pass
-    def on_train_substep_end(self, outputs, batch, batch_idx): pass
-    def on_train_step_start(self): pass
-    def on_train_step_end(self): pass
-    def on_train_epoch_end(self): pass
-    def on_train_end(self): pass
+    def on_train_start(self) -> None:
+        """Called once at the beginning of training, before the first epoch."""
+        pass
 
-    def on_val_start(self): pass
-    def on_val_step_start(self, batch, batch_idx): pass
-    def on_val_step_end(self, outputs, batch, batch_idx): pass
-    def on_val_end(self): pass
+    def on_train_epoch_start(self) -> None:
+        """Called at the beginning of each training epoch."""
+        pass
 
-    def on_test_start(self): pass
-    def on_test_step_start(self, batch, batch_idx): pass
-    def on_test_step_end(self, outputs, batch, batch_idx): pass
-    def on_test_end(self): pass
+    def on_train_substep_start(self, batch, batch_idx) -> None:
+        """Called at the start of each micro-batch (gradient-accumulation substep).
 
-    def on_predict_start(self): pass
-    def on_predict_step_start(self, batch, batch_idx): pass
-    def on_predict_step_end(self, outputs, batch, batch_idx): pass
-    def on_predict_end(self): pass
+        Args:
+            batch: The current micro-batch.
+            batch_idx: Index of the current micro-batch within the epoch.
+        """
+        pass
+
+    def on_train_substep_end(self, outputs, batch, batch_idx) -> None:
+        """Called at the end of each micro-batch (gradient-accumulation substep).
+
+        Args:
+            outputs: The full return value of :meth:`train_step` (a loss
+                tensor or a dict containing a ``"loss"`` key).
+            batch: The current micro-batch.
+            batch_idx: Index of the current micro-batch within the epoch.
+        """
+        pass
+
+    def on_train_step_start(self) -> None:
+        """Called at the start of each optimizer step (after gradient sync)."""
+        pass
+
+    def on_train_step_end(self) -> None:
+        """Called at the end of each optimizer step (after gradient sync)."""
+        pass
+
+    def on_train_epoch_end(self) -> None:
+        """Called at the end of each training epoch."""
+        pass
+
+    def on_train_end(self) -> None:
+        """Called once at the end of training, after the last epoch."""
+        pass
+
+    def on_val_start(self) -> None:
+        """Called at the beginning of the validation loop."""
+        pass
+
+    def on_val_step_start(self, batch, batch_idx) -> None:
+        """Called before each validation batch.
+
+        Args:
+            batch: The current validation batch.
+            batch_idx: Index of the current batch within the validation loop.
+        """
+        pass
+
+    def on_val_step_end(self, outputs, batch, batch_idx) -> None:
+        """Called after each validation batch.
+
+        Args:
+            outputs: The return value of :meth:`val_step`.
+            batch: The current validation batch.
+            batch_idx: Index of the current batch within the validation loop.
+        """
+        pass
+
+    def on_val_end(self) -> None:
+        """Called at the end of the validation loop."""
+        pass
+
+    def on_test_start(self) -> None:
+        """Called at the beginning of the testing loop."""
+        pass
+
+    def on_test_step_start(self, batch, batch_idx) -> None:
+        """Called before each test batch.
+
+        Args:
+            batch: The current test batch.
+            batch_idx: Index of the current batch within the testing loop.
+        """
+        pass
+
+    def on_test_step_end(self, outputs, batch, batch_idx) -> None:
+        """Called after each test batch.
+
+        Args:
+            outputs: The return value of :meth:`test_step`.
+            batch: The current test batch.
+            batch_idx: Index of the current batch within the testing loop.
+        """
+        pass
+
+    def on_test_end(self) -> None:
+        """Called at the end of the testing loop."""
+        pass
+
+    def on_predict_start(self) -> None:
+        """Called at the beginning of the prediction loop."""
+        pass
+
+    def on_predict_step_start(self, batch, batch_idx) -> None:
+        """Called before each prediction batch.
+
+        Args:
+            batch: The current prediction batch.
+            batch_idx: Index of the current batch within the prediction loop.
+        """
+        pass
+
+    def on_predict_step_end(self, outputs, batch, batch_idx) -> None:
+        """Called after each prediction batch.
+
+        Args:
+            outputs: The return value of :meth:`predict_step`.
+            batch: The current prediction batch.
+            batch_idx: Index of the current batch within the prediction loop.
+        """
+        pass
+
+    def on_predict_end(self) -> None:
+        """Called at the end of the prediction loop."""
+        pass
