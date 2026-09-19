@@ -3,7 +3,6 @@
 [![PyPI version](https://badge.fury.io/py/easel.svg)](https://pypi.org/project/easel/)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://github.com/ramanakshay/easel/actions/workflows/tests.yml/badge.svg)](https://github.com/ramanakshay/easel/actions/workflows/tests.yml)
 
 Easel is a modular, flexible, and scalable deep learning framework built on top of PyTorch and HuggingFace Accelerate. It organizes deep learning projects into three logically separate modules — Data, Model, and Engine — providing a clean structure without heavy boilerplate. Distributed training, mixed precision, gradient accumulation, and experiment tracking are all natively supported through Accelerate.
 
