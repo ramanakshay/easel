@@ -1,7 +1,7 @@
 [project]
 name = "easel"
-version = "0.0.1"
-description = "A generalizable deep learning library for SL tasks."
+version = "0.0.2"
+description = "A modular deep learning framework built on PyTorch and Accelerate"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { file = "LICENSE" }

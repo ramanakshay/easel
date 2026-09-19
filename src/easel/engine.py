@@ -30,8 +30,7 @@ class Engine:
 
     Subclass :class:`Engine`, implement the ``*_step`` methods
     (:meth:`train_step`, :meth:`val_step`, :meth:`test_step`,
-    :meth:`predict_step`), and optionally override any of the lifecycle
-    hooks (``on_*``). Then construct the engine and call :meth:`run`.
+    :meth:`predict_step`). Then construct the engine and call :meth:`run`.
 
     The engine wraps HuggingFace ``accelerate`` for device placement,
     distributed training, mixed precision, gradient accumulation, and
@@ -117,7 +116,11 @@ class Engine:
             data: The :class:`~easel.data.Data` instance providing dataloaders.
             model: The :class:`~easel.model.Model` instance to train or evaluate.
             do_train: Whether to run the training loop.
-            do_val: Whether to run the validation loop.
+            do_val: Whether to run the validation loop. Note: ``do_val=False``
+                disables validation entirely (including the post-training
+                ``run_val``). To disable only inline (mid-training) validation
+                while still running a final validation pass, keep
+                ``do_val=True`` and set ``val_strategy="no"``.
             do_test: Whether to run the testing loop.
             do_predict: Whether to run the prediction loop.
             max_epochs: Maximum number of epochs to train. Required if
@@ -191,6 +194,13 @@ class Engine:
         self.val_start = val_start
         self.val_interval = val_interval
 
+        if self.val_strategy not in ("epoch", "step", "no"):
+            raise ValueError(
+                f"val_strategy must be 'epoch', 'step', or 'no', got {val_strategy!r}."
+            )
+        if self.val_interval < 1:
+            raise ValueError(f"val_interval must be >= 1, got {val_interval}.")
+
         self.stage = stage
 
         self.train_batch_size = train_batch_size
@@ -199,6 +209,15 @@ class Engine:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.gradient_clip_value = gradient_clip_value
         self.gradient_clip_algorithm = gradient_clip_algorithm.lower()
+
+        if self.gradient_accumulation_steps < 1:
+            raise ValueError(
+                f"gradient_accumulation_steps must be >= 1, got {gradient_accumulation_steps}."
+            )
+        if self.gradient_clip_algorithm not in ("norm", "value"):
+            raise ValueError(
+                f"gradient_clip_algorithm must be 'norm' or 'value', got {gradient_clip_algorithm!r}."
+            )
 
         self.mixed_precision = mixed_precision
         self.compile = compile
@@ -356,9 +375,6 @@ class Engine:
         self.data.setup(stage=self.stage)
 
         modes = ["train", "val", "test", "predict"]
-        enabled_modes = []
-        loaders = []
-
         for mode in modes:
             if not getattr(self, f"do_{mode}"):
                 continue
@@ -367,27 +383,18 @@ class Engine:
             loader = self._fetch_loader(mode, kwargs)
 
             if loader is None:
+                logger.warning(
+                    f"`do_{mode}` was True but `data.{mode}_dataloader()` returned None. "
+                    f"Disabling the {mode} mode."
+                )
                 setattr(self, f"do_{mode}", False)
-            else:
-                setattr(self, f"{mode}_dataloader", loader)
-                enabled_modes.append(mode)
-                loaders.append(loader)
-
-        if loaders:
-            prepared = self.accelerator.prepare(*loaders)
-            if not isinstance(prepared, tuple):
-                prepared = (prepared,)
-            for i, mode in enumerate(enabled_modes):
-                setattr(self, f"{mode}_dataloader", prepared[i])
-
-        for mode in modes:
-            if not getattr(self, f"do_{mode}"):
                 continue
+
+            loader = self.accelerator.prepare(loader)
+            setattr(self, f"{mode}_dataloader", loader)
+
             steps_attr = f"{mode}_steps_per_epoch" if mode == "train" else f"{mode}_steps"
             if getattr(self, steps_attr) is not None:
-                continue
-            loader = getattr(self, f"{mode}_dataloader")
-            if loader is None:
                 continue
             try:
                 num_batches = len(loader)
@@ -395,7 +402,10 @@ class Engine:
                     num_batches = math.ceil(num_batches / self.gradient_accumulation_steps)
                 setattr(self, steps_attr, num_batches)
             except TypeError:
-                pass
+                logger.debug(
+                    f"Could not determine length of the {mode} dataloader "
+                    f"(likely an IterableDataset). `{steps_attr}` left unset."
+                )
 
         if self.do_train:
             if self.max_epochs is None and self.max_steps is None:
@@ -410,9 +420,13 @@ class Engine:
                         "`max_steps` explicitly, or pass `train_steps_per_epoch` so `max_epochs` "
                         "can be converted to a step limit."
                     )
-            if self.max_epochs is None and self.max_steps is not None:
-                if self.train_steps_per_epoch is not None:
-                    self.max_epochs = math.ceil(self.max_steps / self.train_steps_per_epoch)
+            # max_steps is now guaranteed non-None. When max_steps is set, it
+            # wins as the stop condition; derive max_epochs so the epoch loop
+            # runs long enough for max_steps to be the binding constraint.
+            if self.train_steps_per_epoch is not None and self.train_steps_per_epoch > 0:
+                self.max_epochs = math.ceil(self.max_steps / self.train_steps_per_epoch)
+            else:
+                self.max_epochs = None
 
     def _get_dataloader_kwargs(self, mode: str) -> Dict[str, Any]:
         """Resolve dataloader kwargs for the given mode.
@@ -510,10 +524,7 @@ class Engine:
         """
         if not self.do_train:
             logger.info("do_train=False. Skipping optimizers and preparing model for inference.")
-            prepared = self.accelerator.prepare(self.model)
-            if not isinstance(prepared, tuple):
-                prepared = (prepared,)
-            self.model = prepared[0]
+            self.model = self.accelerator.prepare(self.model)
             return
 
         if self.sync_batch_norm and self.accelerator.num_processes > 1:
@@ -545,8 +556,6 @@ class Engine:
 
         to_prepare = [self.model] + self.optimizers + [s['scheduler'] for s in self.schedulers]
         prepared = self.accelerator.prepare(*to_prepare)
-        if not isinstance(prepared, tuple):
-            prepared = (prepared,)
 
         self.model = prepared[0]
 
@@ -587,9 +596,10 @@ class Engine:
 
         Raises:
             ValueError: If a dict is missing the ``"optimizer"`` key, if a
-                scheduler config dict is missing the ``"scheduler"`` key, or
-                if a ``ReduceLROnPlateau`` scheduler is given without a
-                ``monitor`` key.
+                scheduler config dict is missing the ``"scheduler"`` key, if
+                a ``ReduceLROnPlateau`` scheduler is given without a
+                ``monitor`` key, or if a scheduler config has an invalid
+                ``strategy`` or ``interval``.
             TypeError: If ``opt_conf`` has an unsupported type, or if any
                 element expected to be an optimizer is not one.
         """
@@ -668,6 +678,16 @@ class Engine:
                     raise ValueError(
                         "ReduceLROnPlateau requires a 'monitor' key in the scheduler config."
                     )
+
+            if std_sched['strategy'] not in ("step", "epoch"):
+                raise ValueError(
+                    f"Scheduler 'strategy' must be 'step' or 'epoch', got {std_sched['strategy']!r}."
+                )
+
+            if std_sched['interval'] < 1:
+                raise ValueError(
+                    f"Scheduler 'interval' must be >= 1, got {std_sched['interval']}."
+                )
 
             self.schedulers.append(std_sched)
 
@@ -811,7 +831,7 @@ class Engine:
             idx: Index into :attr:`schedulers`.
 
         Raises:
-            KeyError: If the scheduler expects a ``monitor`` key that is not
+            ValueError: If the scheduler expects a ``monitor`` key that is not
                 present in :attr:`monitor`.
         """
         sched_dict = self.schedulers[idx]
@@ -819,7 +839,7 @@ class Engine:
 
         if monitor_key is not None:
             if monitor_key not in self.monitor:
-                raise KeyError(
+                raise ValueError(
                     f"Scheduler expected '{monitor_key}' in `engine.monitor`, but it was not found. "
                     f"Make sure to populate `engine.monitor['{monitor_key}']` before stepping."
                 )
@@ -846,7 +866,14 @@ class Engine:
     # ------------------------------------------------------------------
 
     def should_validate(self) -> bool:
-        """Return whether validation should run at the current step/epoch."""
+        """Return whether validation should run at the current step/epoch.
+
+        Note: ``self.step`` and ``self.epoch`` are read *after* they are
+        incremented (the increment happens at the optimizer-step boundary
+        and the epoch-end boundary respectively). As a result, the first
+        validation check occurs at step 1 / epoch 1, so ``val_start=0`` is
+        effectively equivalent to ``val_start=1``.
+        """
         if not self.do_val or self.val_strategy == "no":
             return False
         counter = self.step if self.val_strategy == "step" else self.epoch
@@ -876,65 +903,75 @@ class Engine:
         and stepping optimizers/schedulers at gradient-sync boundaries.
 
         Lifecycle hooks called (in order): ``on_train_start``,
-        ``on_train_epoch_start``, ``on_train_substep_start``,
-        ``on_train_substep_end``, ``on_train_step_start``,
-        ``on_train_step_end``, ``on_train_epoch_end``, ``on_train_end``.
+        ``on_train_epoch_start``, ``on_train_step_start``,
+        ``on_train_step_end``, ``on_optimizer_step_start``,
+        ``on_optimizer_step_end``, ``on_train_epoch_end``, ``on_train_end``.
         Validation runs inline when :meth:`should_validate` is true.
         """
         self.on_train_start()
+        self.should_stop = False
+        self.step = 0
+        self.epoch = 0
 
-        epoch = 0
-        while self.max_epochs is None or epoch < self.max_epochs:
+        while self.max_epochs is None or self.epoch < self.max_epochs:
             self.model.train()
             self.on_train_epoch_start()
 
-            epoch_completed = True
             has_batch = False
             for batch_idx, batch in enumerate(self.train_dataloader):
                 has_batch = True
                 with self.accumulate():
-                    self.on_train_substep_start(batch, batch_idx)
-                    outputs = self.train_step(batch)
-                    loss = outputs["loss"] if isinstance(outputs, dict) else outputs
+                    self.on_train_step_start(batch, batch_idx)
+                    outputs = self.train_step(batch, batch_idx)
+                    if isinstance(outputs, dict):
+                        if "loss" not in outputs:
+                            raise ValueError(
+                                "`train_step` returned a dict without the required 'loss' key. "
+                                "Either return a loss tensor directly, or include a 'loss' key in the dict."
+                            )
+                        loss = outputs["loss"]
+                    else:
+                        loss = outputs
                     self.backward(loss)
-                    self.on_train_substep_end(outputs, batch, batch_idx)
+                    self.on_train_step_end(outputs, batch, batch_idx)
 
-                    if self.sync_gradients:
-                        self.clip_gradients()
+                if not self.sync_gradients:
+                    continue
 
-                if self.sync_gradients:
-                    self.on_train_step_start()
-                    self.optimizers_step()
-                    self.optimizers_zero_grad()
-                    self.step += 1
-                    self.schedulers_step(strategy="step")
-                    self.on_train_step_end()
+                self.clip_gradients()
 
-                    if self.val_strategy == "step" and self.should_validate():
-                        self.run_val()
-                        self.model.train()
+                if self.max_steps is not None and self.step >= self.max_steps:
+                    break
 
-                    if self.should_stop or (self.max_steps is not None and self.step >= self.max_steps):
-                        epoch_completed = False
-                        break
+                self.on_optimizer_step_start()
+                self.optimizers_step()
+                self.optimizers_zero_grad()
+                self.step += 1
+                self.schedulers_step(strategy="step")
+                self.on_optimizer_step_end()
 
-            if not has_batch and self.max_epochs is None:
-                logger.warning("Dataloader produced no batches. Stopping training.")
-                break
-
-            if epoch_completed:
-                self.on_train_epoch_end()
-                self.epoch += 1
-                self.schedulers_step(strategy="epoch")
-
-                if self.val_strategy == "epoch" and self.should_validate():
+                if self.val_strategy == "step" and self.should_validate():
                     self.run_val()
                     self.model.train()
 
-            if self.should_stop or (self.max_steps is not None and self.step >= self.max_steps):
+                if self.should_stop:
+                    break
+
+            if not has_batch:
+                logger.warning("Dataloader produced no batches. Stopping training.")
                 break
 
-            epoch += 1
+            self.on_train_epoch_end()
+            self.epoch += 1
+
+            if self.val_strategy == "epoch" and self.should_validate():
+                self.run_val()
+                self.model.train()
+
+            self.schedulers_step(strategy="epoch")
+
+            if self.should_stop or (self.max_steps is not None and self.step >= self.max_steps):
+                break
 
         self.on_train_end()
 
@@ -943,20 +980,22 @@ class Engine:
 
         Iterates over the validation dataloader (up to ``val_steps`` batches),
         calling :meth:`val_step` under ``torch.no_grad()``. Lifecycle hooks:
-        ``on_val_start``, ``on_val_step_start``, ``on_val_step_end``,
-        ``on_val_end``.
+        ``on_val_start``, ``on_val_epoch_start``, ``on_val_step_start``,
+        ``on_val_step_end``, ``on_val_epoch_end``, ``on_val_end``.
         """
         if self.val_dataloader is None:
             return
         self.model.eval()
         self.on_val_start()
+        self.on_val_epoch_start()
         for batch_idx, batch in enumerate(self.val_dataloader):
             if self.val_steps is not None and batch_idx >= self.val_steps:
                 break
             self.on_val_step_start(batch, batch_idx)
             with torch.no_grad():
-                outputs = self.val_step(batch)
+                outputs = self.val_step(batch, batch_idx)
             self.on_val_step_end(outputs, batch, batch_idx)
+        self.on_val_epoch_end()
         self.on_val_end()
 
     def run_test(self) -> None:
@@ -964,20 +1003,22 @@ class Engine:
 
         Iterates over the test dataloader (up to ``test_steps`` batches),
         calling :meth:`test_step` under ``torch.no_grad()``. Lifecycle hooks:
-        ``on_test_start``, ``on_test_step_start``, ``on_test_step_end``,
-        ``on_test_end``.
+        ``on_test_start``, ``on_test_epoch_start``, ``on_test_step_start``,
+        ``on_test_step_end``, ``on_test_epoch_end``, ``on_test_end``.
         """
         if self.test_dataloader is None:
             return
         self.model.eval()
         self.on_test_start()
+        self.on_test_epoch_start()
         for batch_idx, batch in enumerate(self.test_dataloader):
             if self.test_steps is not None and batch_idx >= self.test_steps:
                 break
             self.on_test_step_start(batch, batch_idx)
             with torch.no_grad():
-                outputs = self.test_step(batch)
+                outputs = self.test_step(batch, batch_idx)
             self.on_test_step_end(outputs, batch, batch_idx)
+        self.on_test_epoch_end()
         self.on_test_end()
 
     def run_predict(self) -> None:
@@ -985,36 +1026,40 @@ class Engine:
 
         Iterates over the prediction dataloader (up to ``predict_steps``
         batches), calling :meth:`predict_step` under ``torch.no_grad()``.
-        Lifecycle hooks: ``on_predict_start``, ``on_predict_step_start``,
-        ``on_predict_step_end``, ``on_predict_end``.
+        Lifecycle hooks: ``on_predict_start``, ``on_predict_epoch_start``,
+        ``on_predict_step_start``, ``on_predict_step_end``,
+        ``on_predict_epoch_end``, ``on_predict_end``.
         """
         if self.predict_dataloader is None:
             return
         self.model.eval()
         self.on_predict_start()
+        self.on_predict_epoch_start()
         for batch_idx, batch in enumerate(self.predict_dataloader):
             if self.predict_steps is not None and batch_idx >= self.predict_steps:
                 break
             self.on_predict_step_start(batch, batch_idx)
             with torch.no_grad():
-                outputs = self.predict_step(batch)
+                outputs = self.predict_step(batch, batch_idx)
             self.on_predict_step_end(outputs, batch, batch_idx)
+        self.on_predict_epoch_end()
         self.on_predict_end()
 
     # ------------------------------------------------------------------
     # Step methods (user implements)
     # ------------------------------------------------------------------
 
-    def train_step(self, batch) -> torch.Tensor:
+    def train_step(self, batch, batch_idx) -> torch.Tensor:
         """Compute and return the training loss for a batch.
 
         May return either a loss tensor directly, or a dict containing at
         least a ``"loss"`` key. When a dict is returned, the engine extracts
         ``outputs["loss"]`` for the backward pass and forwards the full
-        ``outputs`` dict to :meth:`on_train_substep_end`.
+        ``outputs`` dict to :meth:`on_train_step_end`.
 
         Args:
             batch: A batch from the training dataloader.
+            batch_idx: Index of the current batch within the epoch.
 
         Returns:
             The loss tensor, or a dict with a ``"loss"`` key.
@@ -1024,11 +1069,12 @@ class Engine:
         """
         raise NotImplementedError("train_step must be implemented to train.")
 
-    def val_step(self, batch) -> Optional[Dict[str, Any]]:
+    def val_step(self, batch, batch_idx) -> Optional[Dict[str, Any]]:
         """Compute and return validation outputs for a batch.
 
         Args:
             batch: A batch from the validation dataloader.
+            batch_idx: Index of the current batch within the validation loop.
 
         Returns:
             A dict of outputs (e.g. ``{"val_loss": ...}``), or ``None``.
@@ -1038,11 +1084,12 @@ class Engine:
         """
         raise NotImplementedError("val_step must be implemented to validate.")
 
-    def test_step(self, batch) -> Optional[Dict[str, Any]]:
+    def test_step(self, batch, batch_idx) -> Optional[Dict[str, Any]]:
         """Compute and return test outputs for a batch.
 
         Args:
             batch: A batch from the test dataloader.
+            batch_idx: Index of the current batch within the testing loop.
 
         Returns:
             A dict of outputs (e.g. ``{"test_loss": ...}``), or ``None``.
@@ -1052,11 +1099,12 @@ class Engine:
         """
         raise NotImplementedError("test_step must be implemented to test.")
 
-    def predict_step(self, batch) -> Any:
+    def predict_step(self, batch, batch_idx) -> Any:
         """Compute and return predictions for a batch.
 
         Args:
             batch: A batch from the prediction dataloader.
+            batch_idx: Index of the current batch within the prediction loop.
 
         Returns:
             The model's predictions for the batch.
@@ -1078,8 +1126,8 @@ class Engine:
         """Called at the beginning of each training epoch."""
         pass
 
-    def on_train_substep_start(self, batch, batch_idx) -> None:
-        """Called at the start of each micro-batch (gradient-accumulation substep).
+    def on_train_step_start(self, batch, batch_idx) -> None:
+        """Called at the start of each training batch (a gradient-accumulation micro-batch).
 
         Args:
             batch: The current micro-batch.
@@ -1087,8 +1135,8 @@ class Engine:
         """
         pass
 
-    def on_train_substep_end(self, outputs, batch, batch_idx) -> None:
-        """Called at the end of each micro-batch (gradient-accumulation substep).
+    def on_train_step_end(self, outputs, batch, batch_idx) -> None:
+        """Called at the end of each training batch (a gradient-accumulation micro-batch).
 
         Args:
             outputs: The full return value of :meth:`train_step` (a loss
@@ -1098,11 +1146,11 @@ class Engine:
         """
         pass
 
-    def on_train_step_start(self) -> None:
+    def on_optimizer_step_start(self) -> None:
         """Called at the start of each optimizer step (after gradient sync)."""
         pass
 
-    def on_train_step_end(self) -> None:
+    def on_optimizer_step_end(self) -> None:
         """Called at the end of each optimizer step (after gradient sync)."""
         pass
 
@@ -1116,6 +1164,10 @@ class Engine:
 
     def on_val_start(self) -> None:
         """Called at the beginning of the validation loop."""
+        pass
+
+    def on_val_epoch_start(self) -> None:
+        """Called at the beginning of each validation epoch (one dataloader pass)."""
         pass
 
     def on_val_step_start(self, batch, batch_idx) -> None:
@@ -1137,12 +1189,20 @@ class Engine:
         """
         pass
 
+    def on_val_epoch_end(self) -> None:
+        """Called at the end of each validation epoch (one dataloader pass)."""
+        pass
+
     def on_val_end(self) -> None:
         """Called at the end of the validation loop."""
         pass
 
     def on_test_start(self) -> None:
         """Called at the beginning of the testing loop."""
+        pass
+
+    def on_test_epoch_start(self) -> None:
+        """Called at the beginning of each test epoch (one dataloader pass)."""
         pass
 
     def on_test_step_start(self, batch, batch_idx) -> None:
@@ -1164,12 +1224,20 @@ class Engine:
         """
         pass
 
+    def on_test_epoch_end(self) -> None:
+        """Called at the end of each test epoch (one dataloader pass)."""
+        pass
+
     def on_test_end(self) -> None:
         """Called at the end of the testing loop."""
         pass
 
     def on_predict_start(self) -> None:
         """Called at the beginning of the prediction loop."""
+        pass
+
+    def on_predict_epoch_start(self) -> None:
+        """Called at the beginning of each prediction epoch (one dataloader pass)."""
         pass
 
     def on_predict_step_start(self, batch, batch_idx) -> None:
@@ -1189,6 +1257,10 @@ class Engine:
             batch: The current prediction batch.
             batch_idx: Index of the current batch within the prediction loop.
         """
+        pass
+
+    def on_predict_epoch_end(self) -> None:
+        """Called at the end of each prediction epoch (one dataloader pass)."""
         pass
 
     def on_predict_end(self) -> None:

@@ -1,7 +1,7 @@
 """Easel Data Class
 
 This module defines the :class:`Data` base class, which users subclass to
-provide datasets and dataloaders for the supervised learning pipeline.
+setup datasets and dataloaders for the supervised learning pipeline.
 
 Public objects:
     Data: Base class for dataset preparation and dataloader construction.
@@ -47,8 +47,7 @@ class Data:
         """Assign datasets for the given stage.
 
         Args:
-            stage: The current stage (``"train"``, ``"eval"``,
-            or ``None``). Override this to build and
+            stage: Defined in the engine. Override this to build and
             assign ``self.train_dataset``, ``self.val_dataset``, etc.
         """
         pass

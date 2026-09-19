@@ -52,7 +52,7 @@ class Model(nn.Module):
         1. A single :class:`~torch.optim.Optimizer`.
         2. ``None`` (only valid when ``do_train=False``).
         3. A dict with an ``"optimizer"`` key and an optional
-           ``"scheduler"`` (or ``"lr_scheduler"``) key. The scheduler may be
+           ``"scheduler"`` key. The scheduler may be
            a bare scheduler or a config dict carrying ``scheduler``,
            ``strategy`` (``"epoch"`` or ``"step"``), ``interval``, and
            ``monitor``.
