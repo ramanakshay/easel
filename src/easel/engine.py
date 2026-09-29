@@ -49,7 +49,8 @@ class Engine:
             that need a monitored metric value.
         step: Global optimizer-step count (incremented after each gradient
             sync boundary).
-        epoch: Current epoch index (incremented at epoch end).
+        epoch: Current epoch index (incremented before
+            ``on_train_epoch_end`` fires).
         should_stop: Set to ``True`` from a hook to early-stop training.
         train_dataloader: Prepared training dataloader (or ``None``).
         val_dataloader: Prepared validation dataloader (or ``None``).
@@ -774,6 +775,29 @@ class Engine:
         """
         return self.accelerator.reduce(tensor, reduction=reduction)
 
+    def log(self,
+            values: Dict[str, Any],
+            step: Optional[int] = None,
+            log_kwargs: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+        """Log metrics to all experiment trackers (main process only).
+
+        A thin wrapper around ``accelerator.log``: a no-op when no trackers
+        were initialized (``log_with=None``), and safe to call from any
+        process.
+
+        Args:
+            values: Dict of metric name to value (``int``, ``float``, or
+                ``str``). Call ``.item()`` on tensors first.
+            step: X-axis step to affiliate the values with. Defaults to
+                :attr:`step`, the engine's global optimizer-step count, so
+                train/val/test logs share one axis across all trackers.
+            log_kwargs: Nested per-tracker kwargs forwarded to
+                ``accelerator.log``, e.g. ``{"wandb": {"commit": False}}``.
+        """
+        if step is None:
+            step = self.step
+        self.accelerator.log(values, step=step, log_kwargs=log_kwargs or {})
+
     def free_memory(self) -> None:
         """Run garbage collection and empty the CUDA cache."""
         gc.collect()
@@ -857,8 +881,8 @@ class Engine:
         """
         counter = self.step if strategy == "step" else self.epoch
         for i, sched_dict in enumerate(self.schedulers):
-            if sched_dict['strategy'] == strategy:
-                if counter % sched_dict['interval'] == 0:
+            if sched_dict['strategy'] == strategy and \
+                    counter % sched_dict['interval'] == 0:
                     self.scheduler_step(i)
 
     # ------------------------------------------------------------------
@@ -884,7 +908,8 @@ class Engine:
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        """Run training, validation, testing, and prediction as configured."""
+        """Run training, validation, testing, and prediction as configured.
+        """
         if self.do_train:
             self.run_train()
         if self.do_val:
@@ -893,6 +918,7 @@ class Engine:
             self.run_test()
         if self.do_predict:
             self.run_predict()
+        self.accelerator.end_training()
 
     def run_train(self) -> None:
         """Run the full training loop.
@@ -961,8 +987,8 @@ class Engine:
                 logger.warning("Dataloader produced no batches. Stopping training.")
                 break
 
-            self.on_train_epoch_end()
             self.epoch += 1
+            self.on_train_epoch_end()
 
             if self.val_strategy == "epoch" and self.should_validate():
                 self.run_val()
@@ -1155,7 +1181,11 @@ class Engine:
         pass
 
     def on_train_epoch_end(self) -> None:
-        """Called at the end of each training epoch."""
+        """Called at the end of each training epoch.
+
+        When the hook fires, :attr:`epoch` has already been incremented, so
+        it holds the count of completed epochs (1-based).
+        """
         pass
 
     def on_train_end(self) -> None:
