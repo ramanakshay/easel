@@ -19,6 +19,7 @@ import torch
 from accelerate import Accelerator
 from accelerate.utils import set_seed, TorchDynamoPlugin
 
+from .callback import Callback
 from .data import Data
 from .model import Model
 
@@ -32,6 +33,11 @@ class Engine:
     (:meth:`train_step`, :meth:`val_step`, :meth:`test_step`,
     :meth:`predict_step`). Then construct the engine and call :meth:`run`.
 
+    Lifecycle hooks are managed through
+    :class:`~easel.callback.Callback` instances passed via ``callbacks``;
+    the engine invokes their hooks automatically at the corresponding
+    points.
+
     The engine wraps HuggingFace ``accelerate`` for device placement,
     distributed training, mixed precision, gradient accumulation, and
     experiment tracking. The :class:`~easel.data.Data` object provides
@@ -41,6 +47,9 @@ class Engine:
     Key attributes:
         model: The (possibly wrapped) :class:`~torch.nn.Module` being trained.
         data: The :class:`~easel.data.Data` instance providing dataloaders.
+        callbacks: List of registered
+            :class:`~easel.callback.Callback` instances whose hooks are
+            invoked automatically at the engine's lifecycle points.
         accelerator: The underlying ``accelerate.Accerator`` instance.
         optimizers: List of prepared optimizers.
         schedulers: List of scheduler config dicts with keys ``scheduler``,
@@ -51,7 +60,8 @@ class Engine:
             sync boundary).
         epoch: Current epoch index (incremented before
             ``on_train_epoch_end`` fires).
-        should_stop: Set to ``True`` from a hook to early-stop training.
+        should_stop: Set to ``True`` from a callback hook to early-stop
+            training.
         train_dataloader: Prepared training dataloader (or ``None``).
         val_dataloader: Prepared validation dataloader (or ``None``).
         test_dataloader: Prepared test dataloader (or ``None``).
@@ -61,6 +71,9 @@ class Engine:
     def __init__(self,
                  data: Data,
                  model: Model,
+
+                 # ── Callbacks ──
+                 callbacks: Optional[Union[Callback, List[Callback]]] = None,
 
                  # ── Mode flags ──
                  do_train: bool = True,
@@ -72,9 +85,9 @@ class Engine:
                  max_epochs: Optional[int] = None,
                  max_steps: Optional[int] = None,
                  train_steps_per_epoch: Optional[int] = None,
-                 val_steps: Optional[int] = None,
-                 test_steps: Optional[int] = None,
-                 predict_steps: Optional[int] = None,
+                 val_steps_per_epoch: Optional[int] = None,
+                 test_steps_per_epoch: Optional[int] = None,
+                 predict_steps_per_epoch: Optional[int] = None,
 
                  # ── Validation ──
                  val_strategy: str = "epoch",
@@ -116,6 +129,10 @@ class Engine:
         Args:
             data: The :class:`~easel.data.Data` instance providing dataloaders.
             model: The :class:`~easel.model.Model` instance to train or evaluate.
+            callbacks: A :class:`~easel.callback.Callback` instance or a
+                list of them. The engine invokes their hooks automatically
+                at the corresponding lifecycle points and attaches itself
+                as ``callback.engine`` before any hook fires.
             do_train: Whether to run the training loop.
             do_val: Whether to run the validation loop. Note: ``do_val=False``
                 disables validation entirely (including the post-training
@@ -131,9 +148,11 @@ class Engine:
                 as the stop condition.
             train_steps_per_epoch: Number of optimizer steps per epoch.
                 Auto-calculated from the dataloader length when not set.
-            val_steps: Maximum number of validation batches per run.
-            test_steps: Maximum number of test batches per run.
-            predict_steps: Maximum number of prediction batches per run.
+            val_steps_per_epoch: Maximum number of validation batches per
+                validation run.
+            test_steps_per_epoch: Maximum number of test batches per run.
+            predict_steps_per_epoch: Maximum number of prediction batches
+                per run.
             val_strategy: When to run validation: ``"epoch"``, ``"step"``,
                 or ``"no"`` (validation disabled within training).
             val_start: Step or epoch index at which validation begins.
@@ -171,10 +190,24 @@ class Engine:
                 train dataloader length is unknown (e.g. an
                 :class:`~torch.utils.data.IterableDataset`) and
                 ``train_steps_per_epoch`` was not provided.
+            TypeError: If ``callbacks`` is neither ``None``, a single
+                :class:`~easel.callback.Callback`, nor a list/tuple of them.
         """
 
         self.model = model
         self.data = data
+
+        if callbacks is None:
+            self.callbacks: List[Callback] = []
+        elif isinstance(callbacks, Callback):
+            self.callbacks = [callbacks]
+        elif isinstance(callbacks, (list, tuple)):
+            self.callbacks = list(callbacks)
+        else:
+            raise TypeError(
+                "callbacks must be a Callback instance, a list/tuple of "
+                f"Callback instances, or None, got {type(callbacks).__name__}."
+            )
 
         self.do_train = do_train
         self.do_val = do_val
@@ -184,9 +217,9 @@ class Engine:
         self.max_epochs = max_epochs
         self.max_steps = max_steps
         self.train_steps_per_epoch = train_steps_per_epoch
-        self.val_steps = val_steps
-        self.test_steps = test_steps
-        self.predict_steps = predict_steps
+        self.val_steps_per_epoch = val_steps_per_epoch
+        self.test_steps_per_epoch = test_steps_per_epoch
+        self.predict_steps_per_epoch = predict_steps_per_epoch
 
         self.step = 0
         self.epoch = 0
@@ -261,6 +294,7 @@ class Engine:
         self.setup_accelerator()
         self.setup_data()
         self.setup_model()
+        self.setup_callbacks()
 
 
     # ------------------------------------------------------------------
@@ -354,7 +388,7 @@ class Engine:
         dataloader via :meth:`_fetch_loader`, prepares it with the
         accelerator, and disables any mode whose dataloader is ``None``.
 
-        Auto-derives ``*_steps_per_epoch`` / ``*_steps`` from the dataloader
+        Auto-derives ``*_steps_per_epoch`` from the dataloader
         length when not explicitly set (training steps are divided by
         ``gradient_accumulation_steps``). Reconciles ``max_epochs`` and
         ``max_steps`` — at least one must be set when ``do_train=True``.
@@ -394,7 +428,7 @@ class Engine:
             loader = self.accelerator.prepare(loader)
             setattr(self, f"{mode}_dataloader", loader)
 
-            steps_attr = f"{mode}_steps_per_epoch" if mode == "train" else f"{mode}_steps"
+            steps_attr = f"{mode}_steps_per_epoch"
             if getattr(self, steps_attr) is not None:
                 continue
             try:
@@ -693,6 +727,40 @@ class Engine:
             self.schedulers.append(std_sched)
 
     # ------------------------------------------------------------------
+    # Setup: callbacks
+    # ------------------------------------------------------------------
+
+    def setup_callbacks(self) -> None:
+        """Attach the engine to every registered callback.
+
+        Sets ``callback.engine`` on each item in :attr:`callbacks` so
+        callback hooks can access the engine without receiving it as an
+        argument. Called at the end of engine initialization, and re-run at
+        the start of :meth:`run` so callbacks added after construction are
+        attached before their first hook fires.
+        """
+        for callback in self.callbacks:
+            callback.engine = self
+
+    def _call_callbacks(self, hook_name: str, *args: Any) -> None:
+        """Invoke ``hook_name`` on every registered callback.
+
+        Tolerant dispatch: items that do not define the hook (including
+        objects that do not subclass :class:`~easel.callback.Callback`)
+        are skipped.
+
+        Args:
+            hook_name: Name of the callback hook (e.g.
+                ``"on_train_epoch_start"``).
+            *args: Positional arguments forwarded verbatim to the hook
+                (e.g. ``batch``, ``batch_idx``, ``outputs``).
+        """
+        for callback in self.callbacks:
+            fn = getattr(callback, hook_name, None)
+            if callable(fn):
+                fn(*args)
+
+    # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
 
@@ -910,6 +978,7 @@ class Engine:
     def run(self) -> None:
         """Run training, validation, testing, and prediction as configured.
         """
+        self.setup_callbacks()
         if self.do_train:
             self.run_train()
         if self.do_val:
@@ -924,30 +993,31 @@ class Engine:
         """Run the full training loop.
 
         Iterates over epochs until ``max_epochs`` is reached or training is
-        early-stopped via :attr:`should_stop` or ``max_steps``. Within each
-        epoch, iterates over the training dataloader, accumulating gradients
-        and stepping optimizers/schedulers at gradient-sync boundaries.
+        early-stopped (a callback set :attr:`should_stop`) or ``max_steps``
+        is reached. Within each epoch, iterates over the training dataloader,
+        accumulating gradients and stepping optimizers/schedulers at
+        gradient-sync boundaries.
 
-        Lifecycle hooks called (in order): ``on_train_start``,
+        Callbacks invoked (in order): ``on_train_start``,
         ``on_train_epoch_start``, ``on_train_step_start``,
         ``on_train_step_end``, ``on_optimizer_step_start``,
         ``on_optimizer_step_end``, ``on_train_epoch_end``, ``on_train_end``.
         Validation runs inline when :meth:`should_validate` is true.
         """
-        self.on_train_start()
         self.should_stop = False
         self.step = 0
         self.epoch = 0
+        self._call_callbacks("on_train_start")
 
         while self.max_epochs is None or self.epoch < self.max_epochs:
             self.model.train()
-            self.on_train_epoch_start()
+            self._call_callbacks("on_train_epoch_start")
 
             has_batch = False
             for batch_idx, batch in enumerate(self.train_dataloader):
                 has_batch = True
                 with self.accumulate():
-                    self.on_train_step_start(batch, batch_idx)
+                    self._call_callbacks("on_train_step_start", batch, batch_idx)
                     outputs = self.train_step(batch, batch_idx)
                     if isinstance(outputs, dict):
                         if "loss" not in outputs:
@@ -959,7 +1029,7 @@ class Engine:
                     else:
                         loss = outputs
                     self.backward(loss)
-                    self.on_train_step_end(outputs, batch, batch_idx)
+                    self._call_callbacks("on_train_step_end", outputs, batch, batch_idx)
 
                 if not self.sync_gradients:
                     continue
@@ -969,12 +1039,12 @@ class Engine:
                 if self.max_steps is not None and self.step >= self.max_steps:
                     break
 
-                self.on_optimizer_step_start()
+                self._call_callbacks("on_optimizer_step_start")
                 self.optimizers_step()
                 self.optimizers_zero_grad()
                 self.step += 1
                 self.schedulers_step(strategy="step")
-                self.on_optimizer_step_end()
+                self._call_callbacks("on_optimizer_step_end")
 
                 if self.val_strategy == "step" and self.should_validate():
                     self.run_val()
@@ -988,7 +1058,7 @@ class Engine:
                 break
 
             self.epoch += 1
-            self.on_train_epoch_end()
+            self._call_callbacks("on_train_epoch_end")
 
             if self.val_strategy == "epoch" and self.should_validate():
                 self.run_val()
@@ -999,77 +1069,82 @@ class Engine:
             if self.should_stop or (self.max_steps is not None and self.step >= self.max_steps):
                 break
 
-        self.on_train_end()
+        self._call_callbacks("on_train_end")
 
     def run_val(self) -> None:
         """Run the validation loop.
 
-        Iterates over the validation dataloader (up to ``val_steps`` batches),
-        calling :meth:`val_step` under ``torch.no_grad()``. Lifecycle hooks:
-        ``on_val_start``, ``on_val_epoch_start``, ``on_val_step_start``,
-        ``on_val_step_end``, ``on_val_epoch_end``, ``on_val_end``.
+        Iterates over the validation dataloader (up to
+        ``val_steps_per_epoch`` batches), calling :meth:`val_step` under
+        ``torch.no_grad()``. Callbacks invoked: ``on_val_start``,
+        ``on_val_epoch_start``, ``on_val_step_start``, ``on_val_step_end``,
+        ``on_val_epoch_end``, ``on_val_end``.
         """
         if self.val_dataloader is None:
             return
         self.model.eval()
-        self.on_val_start()
-        self.on_val_epoch_start()
+        self._call_callbacks("on_val_start")
+        self._call_callbacks("on_val_epoch_start")
         for batch_idx, batch in enumerate(self.val_dataloader):
-            if self.val_steps is not None and batch_idx >= self.val_steps:
+            if self.val_steps_per_epoch is not None and \
+                    batch_idx >= self.val_steps_per_epoch:
                 break
-            self.on_val_step_start(batch, batch_idx)
+            self._call_callbacks("on_val_step_start", batch, batch_idx)
             with torch.no_grad():
                 outputs = self.val_step(batch, batch_idx)
-            self.on_val_step_end(outputs, batch, batch_idx)
-        self.on_val_epoch_end()
-        self.on_val_end()
+            self._call_callbacks("on_val_step_end", outputs, batch, batch_idx)
+        self._call_callbacks("on_val_epoch_end")
+        self._call_callbacks("on_val_end")
 
     def run_test(self) -> None:
         """Run the testing loop.
 
-        Iterates over the test dataloader (up to ``test_steps`` batches),
-        calling :meth:`test_step` under ``torch.no_grad()``. Lifecycle hooks:
-        ``on_test_start``, ``on_test_epoch_start``, ``on_test_step_start``,
-        ``on_test_step_end``, ``on_test_epoch_end``, ``on_test_end``.
+        Iterates over the test dataloader (up to
+        ``test_steps_per_epoch`` batches), calling :meth:`test_step` under
+        ``torch.no_grad()``. Callbacks invoked: ``on_test_start``,
+        ``on_test_epoch_start``, ``on_test_step_start``, ``on_test_step_end``,
+        ``on_test_epoch_end``, ``on_test_end``.
         """
         if self.test_dataloader is None:
             return
         self.model.eval()
-        self.on_test_start()
-        self.on_test_epoch_start()
+        self._call_callbacks("on_test_start")
+        self._call_callbacks("on_test_epoch_start")
         for batch_idx, batch in enumerate(self.test_dataloader):
-            if self.test_steps is not None and batch_idx >= self.test_steps:
+            if self.test_steps_per_epoch is not None and \
+                    batch_idx >= self.test_steps_per_epoch:
                 break
-            self.on_test_step_start(batch, batch_idx)
+            self._call_callbacks("on_test_step_start", batch, batch_idx)
             with torch.no_grad():
                 outputs = self.test_step(batch, batch_idx)
-            self.on_test_step_end(outputs, batch, batch_idx)
-        self.on_test_epoch_end()
-        self.on_test_end()
+            self._call_callbacks("on_test_step_end", outputs, batch, batch_idx)
+        self._call_callbacks("on_test_epoch_end")
+        self._call_callbacks("on_test_end")
 
     def run_predict(self) -> None:
         """Run the prediction loop.
 
-        Iterates over the prediction dataloader (up to ``predict_steps``
-        batches), calling :meth:`predict_step` under ``torch.no_grad()``.
-        Lifecycle hooks: ``on_predict_start``, ``on_predict_epoch_start``,
-        ``on_predict_step_start``, ``on_predict_step_end``,
-        ``on_predict_epoch_end``, ``on_predict_end``.
+        Iterates over the prediction dataloader (up to
+        ``predict_steps_per_epoch`` batches), calling :meth:`predict_step`
+        under ``torch.no_grad()``. Callbacks invoked: ``on_predict_start``,
+        ``on_predict_epoch_start``, ``on_predict_step_start``,
+        ``on_predict_step_end``, ``on_predict_epoch_end``, ``on_predict_end``.
         """
         if self.predict_dataloader is None:
             return
         self.model.eval()
-        self.on_predict_start()
-        self.on_predict_epoch_start()
+        self._call_callbacks("on_predict_start")
+        self._call_callbacks("on_predict_epoch_start")
         for batch_idx, batch in enumerate(self.predict_dataloader):
-            if self.predict_steps is not None and batch_idx >= self.predict_steps:
+            if self.predict_steps_per_epoch is not None and \
+                    batch_idx >= self.predict_steps_per_epoch:
                 break
-            self.on_predict_step_start(batch, batch_idx)
+            self._call_callbacks("on_predict_step_start", batch, batch_idx)
             with torch.no_grad():
                 outputs = self.predict_step(batch, batch_idx)
-            self.on_predict_step_end(outputs, batch, batch_idx)
-        self.on_predict_epoch_end()
-        self.on_predict_end()
+            self._call_callbacks("on_predict_step_end", outputs, batch, batch_idx)
+        self._call_callbacks("on_predict_epoch_end")
+        self._call_callbacks("on_predict_end")
 
     # ------------------------------------------------------------------
     # Step methods (user implements)
@@ -1139,160 +1214,3 @@ class Engine:
             NotImplementedError: If not overridden in a subclass.
         """
         raise NotImplementedError("predict_step must be implemented to predict.")
-
-    # ------------------------------------------------------------------
-    # Lifecycle hooks (all no-ops by default)
-    # ------------------------------------------------------------------
-
-    def on_train_start(self) -> None:
-        """Called once at the beginning of training, before the first epoch."""
-        pass
-
-    def on_train_epoch_start(self) -> None:
-        """Called at the beginning of each training epoch."""
-        pass
-
-    def on_train_step_start(self, batch, batch_idx) -> None:
-        """Called at the start of each training batch (a gradient-accumulation micro-batch).
-
-        Args:
-            batch: The current micro-batch.
-            batch_idx: Index of the current micro-batch within the epoch.
-        """
-        pass
-
-    def on_train_step_end(self, outputs, batch, batch_idx) -> None:
-        """Called at the end of each training batch (a gradient-accumulation micro-batch).
-
-        Args:
-            outputs: The full return value of :meth:`train_step` (a loss
-                tensor or a dict containing a ``"loss"`` key).
-            batch: The current micro-batch.
-            batch_idx: Index of the current micro-batch within the epoch.
-        """
-        pass
-
-    def on_optimizer_step_start(self) -> None:
-        """Called at the start of each optimizer step (after gradient sync)."""
-        pass
-
-    def on_optimizer_step_end(self) -> None:
-        """Called at the end of each optimizer step (after gradient sync)."""
-        pass
-
-    def on_train_epoch_end(self) -> None:
-        """Called at the end of each training epoch.
-
-        When the hook fires, :attr:`epoch` has already been incremented, so
-        it holds the count of completed epochs (1-based).
-        """
-        pass
-
-    def on_train_end(self) -> None:
-        """Called once at the end of training, after the last epoch."""
-        pass
-
-    def on_val_start(self) -> None:
-        """Called at the beginning of the validation loop."""
-        pass
-
-    def on_val_epoch_start(self) -> None:
-        """Called at the beginning of each validation epoch (one dataloader pass)."""
-        pass
-
-    def on_val_step_start(self, batch, batch_idx) -> None:
-        """Called before each validation batch.
-
-        Args:
-            batch: The current validation batch.
-            batch_idx: Index of the current batch within the validation loop.
-        """
-        pass
-
-    def on_val_step_end(self, outputs, batch, batch_idx) -> None:
-        """Called after each validation batch.
-
-        Args:
-            outputs: The return value of :meth:`val_step`.
-            batch: The current validation batch.
-            batch_idx: Index of the current batch within the validation loop.
-        """
-        pass
-
-    def on_val_epoch_end(self) -> None:
-        """Called at the end of each validation epoch (one dataloader pass)."""
-        pass
-
-    def on_val_end(self) -> None:
-        """Called at the end of the validation loop."""
-        pass
-
-    def on_test_start(self) -> None:
-        """Called at the beginning of the testing loop."""
-        pass
-
-    def on_test_epoch_start(self) -> None:
-        """Called at the beginning of each test epoch (one dataloader pass)."""
-        pass
-
-    def on_test_step_start(self, batch, batch_idx) -> None:
-        """Called before each test batch.
-
-        Args:
-            batch: The current test batch.
-            batch_idx: Index of the current batch within the testing loop.
-        """
-        pass
-
-    def on_test_step_end(self, outputs, batch, batch_idx) -> None:
-        """Called after each test batch.
-
-        Args:
-            outputs: The return value of :meth:`test_step`.
-            batch: The current test batch.
-            batch_idx: Index of the current batch within the testing loop.
-        """
-        pass
-
-    def on_test_epoch_end(self) -> None:
-        """Called at the end of each test epoch (one dataloader pass)."""
-        pass
-
-    def on_test_end(self) -> None:
-        """Called at the end of the testing loop."""
-        pass
-
-    def on_predict_start(self) -> None:
-        """Called at the beginning of the prediction loop."""
-        pass
-
-    def on_predict_epoch_start(self) -> None:
-        """Called at the beginning of each prediction epoch (one dataloader pass)."""
-        pass
-
-    def on_predict_step_start(self, batch, batch_idx) -> None:
-        """Called before each prediction batch.
-
-        Args:
-            batch: The current prediction batch.
-            batch_idx: Index of the current batch within the prediction loop.
-        """
-        pass
-
-    def on_predict_step_end(self, outputs, batch, batch_idx) -> None:
-        """Called after each prediction batch.
-
-        Args:
-            outputs: The return value of :meth:`predict_step`.
-            batch: The current prediction batch.
-            batch_idx: Index of the current batch within the prediction loop.
-        """
-        pass
-
-    def on_predict_epoch_end(self) -> None:
-        """Called at the end of each prediction epoch (one dataloader pass)."""
-        pass
-
-    def on_predict_end(self) -> None:
-        """Called at the end of the prediction loop."""
-        pass
